@@ -27,9 +27,13 @@ export async function executeDCA(
   const chain = opts.chain ?? "base";
   const dryRun = opts.dryRun ?? true;
 
-  // Get current price
-  const prices = await client.getPrices(token);
-  const price = parseFloat(prices[0]?.priceUsd ?? "0");
+  // Get current price (direct API call to avoid SDK bug with ?token= vs ?symbols=)
+  const apiKey = process.env.SUWAPPU_API_KEY ?? "";
+  const priceRes = await fetch(`https://api.suwappu.bot/v1/agent/prices?symbols=${token}`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  const priceData = await priceRes.json() as { prices?: Record<string, { usd: number }> };
+  const price = priceData.prices?.[token]?.usd ?? 0;
 
   if (!opts.json) {
     log("dca", `${token}: ${formatUsd(price)}`);

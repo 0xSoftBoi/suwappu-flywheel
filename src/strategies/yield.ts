@@ -21,6 +21,7 @@ export async function scanYield(
 
   const sorted = [...markets]
     .filter((m) => m.supplyApy >= (opts.minApy ?? 0))
+    // Note: High APYs may include protocol incentives (MORPHO token rewards)
     .sort((a, b) => b.supplyApy - a.supplyApy)
     .slice(0, opts.top ?? 10);
 

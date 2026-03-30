@@ -83,11 +83,16 @@ program.command("status").description("Portfolio dashboard")
       const chains = await client.listChains();
       log("status", `Connected — ${chains.length} chains available`);
 
-      // Price check
-      const prices = await client.getPrices("ETH,BTC,SOL");
+      // Price check (direct API call to avoid npm SDK ?token= bug)
+      const apiKey = requireEnv("SUWAPPU_API_KEY");
+      const priceRes = await fetch("https://api.suwappu.bot/v1/agent/prices?symbols=ETH,BTC,SOL", {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      const priceData = await priceRes.json() as { prices: Record<string, { usd: number; change_24h: number }> };
       console.log();
-      for (const p of prices) {
-        console.log(`  ${p.token.padEnd(5)} $${parseFloat(p.priceUsd).toLocaleString()} (${parseFloat(p.change24h) >= 0 ? "+" : ""}${parseFloat(p.change24h).toFixed(2)}%)`);
+      for (const [token, data] of Object.entries(priceData.prices)) {
+        const change = data.change_24h ?? 0;
+        console.log(`  ${token.padEnd(5)} $${data.usd.toLocaleString()} (${change >= 0 ? "+" : ""}${change.toFixed(2)}%)`);
       }
 
       // Fear index
