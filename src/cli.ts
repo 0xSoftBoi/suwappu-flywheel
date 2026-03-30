@@ -108,6 +108,58 @@ program.command("status").description("Portfolio dashboard")
     } catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
   });
 
+// ── Watch (continuous monitoring) ──
+program.command("watch").description("Continuously scan for opportunities")
+  .option("--interval <secs>", "scan interval in seconds", parseInt, 300)
+  .option("--tokens <list>", "arb tokens", (v: string) => v.split(","), ["ETH", "SOL"])
+  .option("--chains <list>", "arb chains", (v: string) => v.split(","), ["base", "arbitrum", "optimism", "ethereum"])
+  .option("--min-spread <pct>", "min arb spread %", parseFloat, 0.3)
+  .option("--json", "JSON output")
+  .action(async (opts) => {
+    const client = getClient();
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    let round = 0;
+
+    process.on("SIGINT", () => { log("watch", `Stopped after ${round} rounds.`); process.exit(0); });
+    process.on("SIGTERM", () => { log("watch", `Stopped after ${round} rounds.`); process.exit(0); });
+
+    if (!opts.json) {
+      log("watch", `Continuous monitoring every ${opts.interval}s. Ctrl+C to stop.`);
+      log("watch", `Arb: ${opts.tokens.join(",")} across ${opts.chains.join(",")}`);
+      console.log();
+    }
+
+    while (true) {
+      round++;
+      try {
+        if (!opts.json) log("watch", `── Round ${round} ──`);
+
+        // Fear index
+        const fear = await getFearIndex();
+        if (!opts.json) log("watch", `Fear: ${fear.value}/100 (${fear.classification}) | DCA mult: ${fearMultiplier(fear.value)}x`);
+
+        // Arb scan
+        const opps = await scanArb(client, {
+          tokens: opts.tokens,
+          chains: opts.chains,
+          minSpread: opts.minSpread,
+          json: opts.json,
+        });
+
+        const viable = opps.filter((o) => o.viable);
+        if (viable.length > 0 && !opts.json) {
+          log("watch", `🚨 ${viable.length} PROFITABLE arb opportunity(ies) found!`);
+        }
+
+        if (!opts.json) console.log();
+      } catch (e: any) {
+        if (!opts.json) log("watch", `Error: ${e.message}`);
+      }
+
+      await sleep(opts.interval * 1000);
+    }
+  });
+
 // ── Run All ──
 program.command("run").description("Run all enabled strategies once")
   .option("--dry-run", "don't execute any trades", true)
@@ -141,7 +193,7 @@ program.command("run").description("Run all enabled strategies once")
 
       // 4. Arb scan
       if (!opts.json) console.log("\n── ARB SCANNER ──");
-      await scanArb(client, { tokens: ["ETH"], chains: ["base", "arbitrum", "optimism"], minSpread: 0.1, json: opts.json });
+      await scanArb(client, { tokens: ["ETH", "SOL"], chains: ["base", "arbitrum", "optimism", "ethereum"], minSpread: 0.1, json: opts.json });
 
       // 5. Prediction scout
       if (!opts.json) console.log("\n── PREDICTION SCOUT ──");

@@ -8,6 +8,28 @@ interface ArbOpportunity {
   buyPrice: number;
   sellPrice: number;
   spreadPct: number;
+  estProfitPer1K: number; // estimated profit on $1000 trade
+  viable: boolean; // profitable after estimated gas+bridge fees
+}
+
+// Estimated bridge + gas costs per chain pair (conservative)
+const BRIDGE_COST_USD: Record<string, number> = {
+  "base→ethereum": 3.0,
+  "arbitrum→ethereum": 3.0,
+  "optimism→ethereum": 3.0,
+  "base→arbitrum": 0.50,
+  "base→optimism": 0.50,
+  "arbitrum→base": 0.50,
+  "arbitrum→optimism": 0.50,
+  "optimism→base": 0.50,
+  "optimism→arbitrum": 0.50,
+  "ethereum→base": 5.0,
+  "ethereum→arbitrum": 5.0,
+  "ethereum→optimism": 5.0,
+};
+
+function getBridgeCost(from: string, to: string): number {
+  return BRIDGE_COST_USD[`${from}→${to}`] ?? 2.0;
 }
 
 export async function scanArb(
@@ -59,6 +81,12 @@ export async function scanArb(
         if (i === j) continue;
         const spread = ((chainPrices[j].price - chainPrices[i].price) / chainPrices[i].price) * 100;
         if (spread >= minSpread) {
+          const tradeSize = 1000;
+          const grossProfit = tradeSize * (spread / 100);
+          const bridgeCost = getBridgeCost(chainPrices[i].chain, chainPrices[j].chain);
+          const slippage = tradeSize * 0.003; // ~0.3% slippage estimate
+          const netProfit = grossProfit - bridgeCost - slippage;
+
           const opp: ArbOpportunity = {
             token,
             buyChain: chainPrices[i].chain,
@@ -66,6 +94,8 @@ export async function scanArb(
             buyPrice: chainPrices[i].price,
             sellPrice: chainPrices[j].price,
             spreadPct: spread,
+            estProfitPer1K: netProfit,
+            viable: netProfit > 0,
           };
           opportunities.push(opp);
         }
@@ -80,12 +110,22 @@ export async function scanArb(
     if (opportunities.length === 0) {
       log("arb", `No spreads above ${minSpread}% found`);
     } else {
-      log("arb", `Found ${opportunities.length} opportunities:`);
-      for (const o of opportunities.sort((a, b) => b.spreadPct - a.spreadPct)) {
-        console.log(`    ${o.token}: Buy on ${o.buyChain} (${formatUsd(o.buyPrice)}) → Sell on ${o.sellChain} (${formatUsd(o.sellPrice)}) | Spread: ${formatPct(o.spreadPct)}`);
+      const viable = opportunities.filter((o) => o.viable);
+      const notViable = opportunities.filter((o) => !o.viable);
+
+      log("arb", `Found ${opportunities.length} spreads (${viable.length} profitable after fees):`);
+      for (const o of opportunities.sort((a, b) => b.estProfitPer1K - a.estProfitPer1K)) {
+        const profitStr = o.viable
+          ? `✅ Net: ${formatUsd(o.estProfitPer1K)}/1K`
+          : `❌ Net: ${formatUsd(o.estProfitPer1K)}/1K (fees eat profit)`;
+        console.log(`    ${o.token}: ${o.buyChain} → ${o.sellChain} | Spread: ${formatPct(o.spreadPct)} | ${profitStr}`);
       }
       console.log();
-      log("arb", "Note: Cross-chain arb requires bridge time (1-15min). Prices may move.");
+      if (viable.length > 0) {
+        const best = viable[0];
+        log("arb", `💰 Best: ${best.token} ${best.buyChain}→${best.sellChain} nets ${formatUsd(best.estProfitPer1K)} per $1K traded`);
+      }
+      log("arb", "Note: Bridge time 1-15min. Prices may move. Slippage estimated at 0.3%.");
     }
   }
 

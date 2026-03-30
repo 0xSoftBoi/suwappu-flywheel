@@ -1,5 +1,38 @@
 import type { SuwappuClient } from "@suwappu/sdk";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 import { log, formatUsd, logJson } from "../utils.js";
+
+const HISTORY_DIR = join(homedir(), ".suwappu-flywheel");
+const HISTORY_FILE = join(HISTORY_DIR, "dca-history.json");
+
+interface HistoryEntry {
+  timestamp: string;
+  token: string;
+  amount: string;
+  price: number;
+  toAmount: string;
+  chain: string;
+  fearIndex?: number;
+  multiplier?: number;
+}
+
+function loadHistory(): HistoryEntry[] {
+  try {
+    if (existsSync(HISTORY_FILE)) return JSON.parse(readFileSync(HISTORY_FILE, "utf-8"));
+  } catch {}
+  return [];
+}
+
+function saveHistory(entries: HistoryEntry[]) {
+  if (!existsSync(HISTORY_DIR)) mkdirSync(HISTORY_DIR, { recursive: true });
+  writeFileSync(HISTORY_FILE, JSON.stringify(entries, null, 2));
+}
+
+export function getDCAHistory(): HistoryEntry[] {
+  return loadHistory();
+}
 
 interface DCAResult {
   token: string;
@@ -65,11 +98,23 @@ export async function executeDCA(
     try {
       const swap = await client.executeSwap(quote.id);
       result.executed = true;
+
+      // Save to history
+      const history = loadHistory();
+      history.push({
+        timestamp: new Date().toISOString(),
+        token, amount, price,
+        toAmount: quote.toAmount,
+        chain,
+      });
+      saveHistory(history);
+
       if (opts.json) {
         logJson({ strategy: "dca", action: "executed", txHash: swap.txHash, ...result });
       } else {
         log("dca", `EXECUTED: ${amount} USDC → ${quote.toAmount} ${token}`);
         log("dca", `  TX: ${swap.txHash || "pending"} | Status: ${swap.status}`);
+        log("dca", `  History: ${history.length} buys recorded in ~/.suwappu-flywheel/dca-history.json`);
       }
     } catch (e: any) {
       if (opts.json) {
