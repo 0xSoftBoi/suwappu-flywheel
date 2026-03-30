@@ -1,0 +1,8 @@
+{
+  "strategies": {
+    "yield": { "enabled": true, "chain": 8453, "minApy": 3.0, "top": 5 },
+    "dca": { "enabled": true, "token": "ETH", "amount": "5", "chain": "base", "fearAdjust": true },
+    "arb": { "enabled": true, "tokens": ["ETH"], "chains": ["base", "arbitrum", "optimism"], "minSpread": 0.1 },
+    "predict": { "enabled": true, "top": 5 }
+  }
+}
