@@ -33,11 +33,12 @@ program.command("dca").description("Execute a DCA buy (or dry-run)")
   .option("--amount <n>", "USDC amount", "5")
   .option("--chain <chain>", "chain to trade on", "base")
   .option("--fear-adjust", "multiply amount by Fear & Greed Index factor")
-  .option("--dry-run", "quote only, don't execute", true)
+  .option("--execute", "execute the trade (default: dry-run only)")
   .option("--json", "JSON output")
   .action(async (opts) => {
     try {
       const client = getClient();
+      const dryRun = !opts.execute;
       let amount = opts.amount;
 
       if (opts.fearAdjust) {
@@ -49,7 +50,7 @@ program.command("dca").description("Execute a DCA buy (or dry-run)")
         }
       }
 
-      await executeDCA(client, { ...opts, amount });
+      await executeDCA(client, { ...opts, amount, dryRun });
     } catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
   });
 
@@ -162,11 +163,11 @@ program.command("watch").description("Continuously scan for opportunities")
 
 // ── Run All ──
 program.command("run").description("Run all enabled strategies once")
-  .option("--dry-run", "don't execute any trades", true)
+  .option("--execute", "execute DCA trades (default: scan only)")
   .option("--json", "JSON output")
   .action(async (opts) => {
     const client = getClient();
-    const dryRun = opts.dryRun;
+    const dryRun = !opts.execute;
 
     if (!opts.json) {
       console.log("╔══════════════════════════════════════════╗");
@@ -202,7 +203,7 @@ program.command("run").description("Run all enabled strategies once")
       if (!opts.json) {
         console.log("\n── SUMMARY ──");
         log("run", "All strategies scanned. Review above for opportunities.");
-        if (dryRun) log("run", "Remove --dry-run to enable DCA execution.");
+        if (dryRun) log("run", "Add --execute to enable DCA trades.");
       }
     } catch (e: any) {
       console.error(`Error: ${e.message}`);

@@ -96,7 +96,15 @@ export async function executeDCA(
   } else {
     // Execute the swap
     try {
-      const swap = await client.executeSwap(quote.id);
+      // Call swap/execute directly with wallet_address (SDK doesn't pass it)
+      const walletAddress = process.env.WALLET_ADDRESS;
+      if (!walletAddress) throw new Error("WALLET_ADDRESS not set");
+      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/execute", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ quote_id: quote.id, wallet_address: walletAddress }),
+      });
+      const swap = await swapRes.json() as { txHash?: string; status?: string; swap_id?: number };
       result.executed = true;
 
       // Save to history
