@@ -443,4 +443,19 @@ program.command("run").description("Run full flywheel: DCA buy + Grid sell + Bra
     }
   });
 
+// ── Scalp ──
+program.command("scalp").description("Continuous mean-reversion micro-scalp bot with ML data collection")
+  .option("--execute", "execute live trades (default: dry-run)")
+  .option("--amount <n>", "trade size in USDC", parseFloat, 2)
+  .option("--interval <secs>", "poll interval in seconds", parseInt, 10)
+  .action(async (opts) => {
+    const { runScalper } = await import("./scalper.js");
+    await runScalper({
+      execute: !!opts.execute,
+      amount: opts.amount,
+      interval: opts.interval,
+      dryRun: !opts.execute,
+    });
+  });
+
 program.parseAsync();

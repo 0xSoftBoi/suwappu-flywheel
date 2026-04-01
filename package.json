@@ -12,6 +12,7 @@
     "predict": "bun run src/cli.ts predict",
     "status": "bun run src/cli.ts status",
     "tui": "bun run src/tui.ts",
+    "scalp": "bun run src/scalper.ts",
     "check": "tsc --noEmit",
     "test": "bun test"
   },
