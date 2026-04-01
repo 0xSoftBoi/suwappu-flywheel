@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Self-sustaining multi-strategy DeFi agent — yield rotation, fear-DCA, grid bot, airdrop farming, prediction scout",
   "type": "module",
-  "bin": { "suwappu-flywheel": "src/cli.ts" },
+  "bin": { "suwappu-flywheel": "src/cli.ts", "flywheel-tui": "src/tui.ts" },
   "scripts": {
     "start": "bun run src/cli.ts run --config config.example.json --dry-run",
     "yield": "bun run src/cli.ts yield",
@@ -11,6 +11,7 @@
     "arb": "bun run src/cli.ts arb",
     "predict": "bun run src/cli.ts predict",
     "status": "bun run src/cli.ts status",
+    "tui": "bun run src/tui.ts",
     "check": "tsc --noEmit",
     "test": "bun test"
   },

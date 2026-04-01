@@ -1,4 +1,23 @@
 #!/usr/bin/env bun
+
+// Auto-load .env from project root (works when run globally via bun link)
+import { resolve, dirname } from "path";
+import { fileURLToPath } from "url";
+const __dir = dirname(fileURLToPath(import.meta.url));
+const envPath = resolve(__dir, "..", ".env");
+try {
+  const envFile = await Bun.file(envPath).text();
+  for (const line of envFile.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    const val = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, "");
+    if (!process.env[key]) process.env[key] = val;
+  }
+} catch {}
+
 import { Command } from "commander";
 import { createClient } from "@suwappu/sdk";
 import { requireEnv, log } from "./utils.js";
@@ -6,9 +25,13 @@ import { scanYield } from "./strategies/yield.js";
 import { executeDCA, getFearIndex, fearMultiplier } from "./strategies/dca.js";
 import { scanArb } from "./strategies/arb.js";
 import { scanPredictions } from "./strategies/predict.js";
-import { loadState, saveState, recordTrade } from "./brain/state.js";
+import { checkGrid, resetGrid } from "./strategies/grid.js";
+import { loadState, saveState, recordTrade, syncFromDCAHistory, updatePortfolio } from "./brain/state.js";
+import { getUSDCBalance, getETHBalance } from "./strategies/dca.js";
+import { getCandles, calcRSI, rsiMultiplier, calcATRPct } from "./indicators.js";
 import { backfillRewards } from "./brain/reward.js";
 import { adaptParameters, logAgentState } from "./brain/adapt.js";
+import { generatePortfolioReport, getRecommendedSize, formatPortfolioReport } from "./portfolio.js";
 
 function getClient() {
   return createClient({ apiKey: requireEnv("SUWAPPU_API_KEY") });
@@ -75,6 +98,18 @@ program.command("predict").description("Scout prediction markets for mispricing"
   .action(async (opts) => {
     try { await scanPredictions(getClient(), opts); }
     catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
+  });
+
+// ── Grid (take-profit) ──
+program.command("grid").description("Check/execute take-profit grid levels")
+  .option("--execute", "execute sells when levels are hit (default: check only)")
+  .option("--reset", "reset grid levels for a new cycle")
+  .option("--json", "JSON output")
+  .action(async (opts) => {
+    try {
+      if (opts.reset) { resetGrid(); return; }
+      await checkGrid({ execute: opts.execute, json: opts.json });
+    } catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
   });
 
 // ── Status ──
@@ -164,28 +199,109 @@ program.command("watch").description("Continuously scan for opportunities")
     }
   });
 
-// ── Run All (V2 — Self-Improving) ──
-program.command("run").description("Run all strategies with self-improving brain")
-  .option("--execute", "execute DCA trades (default: scan only)")
+// ── Portfolio ──
+program.command("portfolio").description("Risk assessment, Kelly criterion, strategy attribution")
+  .option("--json", "JSON output")
+  .action(async (opts) => {
+    const apiKey = requireEnv("SUWAPPU_API_KEY");
+    const walletAddress = process.env.WALLET_ADDRESS || "";
+    const state = loadState();
+    syncFromDCAHistory(state);
+
+    // Fetch prices + balances
+    const priceRes = await fetch("https://api.suwappu.bot/v1/agent/prices?symbols=ETH,BTC,SOL", {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    const priceData = await priceRes.json() as any;
+    const prices: Record<string, number> = {};
+    for (const [k, v] of Object.entries(priceData.prices || {})) {
+      prices[k] = (v as any).usd ?? 0;
+    }
+    const ethPrice = prices.ETH ?? 0;
+
+    let usdcBal = 0, ethBal = 0;
+    if (walletAddress) {
+      [usdcBal, ethBal] = await Promise.all([getUSDCBalance(walletAddress), getETHBalance(walletAddress)]);
+      if (usdcBal < 0) usdcBal = 0;
+      if (ethBal < 0) ethBal = 0;
+    }
+
+    const totalValue = usdcBal + ethBal * ethPrice;
+    updatePortfolio(state, usdcBal, ethBal, ethPrice);
+
+    // Backfill rewards
+    const getPrice = async (token: string) => {
+      const res = await fetch(`https://api.suwappu.bot/v1/agent/prices?symbols=${token}`, {
+        headers: { Authorization: `Bearer ${apiKey}` },
+      });
+      const data = await res.json() as any;
+      return data.prices?.[token]?.usd ?? 0;
+    };
+    await backfillRewards(state, getPrice);
+    adaptParameters(state);
+    saveState(state);
+
+    // Generate report
+    const report = generatePortfolioReport(state, prices, totalValue);
+
+    // Sizing recommendation (need market data)
+    const fear = await getFearIndex();
+    let rsi = 50, atrPct = 2.0;
+    try {
+      const candles = await getCandles("ETHUSDC", "4h", 15);
+      rsi = calcRSI(candles);
+      atrPct = calcATRPct(candles);
+    } catch {}
+
+    const sizing = getRecommendedSize(state, usdcBal, { fearValue: fear.value, rsi, atrPct });
+
+    if (opts.json) {
+      console.log(JSON.stringify({ ...report, sizing }, null, 2));
+    } else {
+      const lines = formatPortfolioReport(report, sizing);
+      for (const line of lines) console.log(line);
+    }
+  });
+
+// ── Run All (V3 — Unified Buy+Sell+Learn) ──
+program.command("run").description("Run full flywheel: DCA buy + Grid sell + Brain learn")
+  .option("--execute", "execute trades (default: scan only)")
+  .option("--amount <n>", "base DCA amount in USDC", "2")
   .option("--json", "JSON output")
   .action(async (opts) => {
     const client = getClient();
     const dryRun = !opts.execute;
+    const apiKey = requireEnv("SUWAPPU_API_KEY");
+    const walletAddress = process.env.WALLET_ADDRESS || "";
 
-    // 0. Load persistent brain state
+    // 0. Load brain state
     const state = loadState();
 
     if (!opts.json) {
       console.log("╔══════════════════════════════════════════╗");
-      console.log("║    SUWAPPU FLYWHEEL V2 — SELF-IMPROVING ║");
+      console.log("║  SUWAPPU FLYWHEEL V3 — BUY + SELL + LEARN║");
       console.log("╚══════════════════════════════════════════╝");
-      if (dryRun) console.log("  Mode: SCAN ONLY (add --execute to trade)\n");
-      else console.log("  Mode: LIVE EXECUTION\n");
+      console.log(`  Mode: ${dryRun ? "SCAN ONLY (add --execute)" : "LIVE EXECUTION"}\n`);
     }
 
     try {
-      // 1. Backfill rewards for previous trades
-      const apiKey = requireEnv("SUWAPPU_API_KEY");
+      // 1. Sync brain state with DCA history
+      const synced = syncFromDCAHistory(state);
+      if (synced > 0 && !opts.json) {
+        log("brain", `Synced ${synced} trade(s) from DCA history`);
+      }
+
+      // 2. Get on-chain balances
+      let usdcBal = -1;
+      let ethBal = -1;
+      if (walletAddress) {
+        [usdcBal, ethBal] = await Promise.all([
+          getUSDCBalance(walletAddress),
+          getETHBalance(walletAddress),
+        ]);
+      }
+
+      // 3. Get current ETH price
       const getPrice = async (token: string) => {
         const res = await fetch(`https://api.suwappu.bot/v1/agent/prices?symbols=${token}`, {
           headers: { Authorization: `Bearer ${apiKey}` },
@@ -193,34 +309,74 @@ program.command("run").description("Run all strategies with self-improving brain
         const data = await res.json() as { prices?: Record<string, { usd: number }> };
         return data.prices?.[token]?.usd ?? 0;
       };
+      const ethPrice = await getPrice("ETH");
+
+      // 4. Update portfolio with real balances
+      if (usdcBal >= 0 && ethBal >= 0) {
+        updatePortfolio(state, usdcBal, ethBal, ethPrice);
+        if (!opts.json) {
+          const totalVal = usdcBal + ethBal * ethPrice;
+          const pnl = totalVal - state.portfolio.startingCapital;
+          const pnlPct = state.portfolio.startingCapital > 0
+            ? (pnl / state.portfolio.startingCapital * 100).toFixed(2)
+            : "0.00";
+          log("portfolio", `USDC: $${usdcBal.toFixed(2)} | ETH: ${ethBal.toFixed(6)} ($${(ethBal * ethPrice).toFixed(2)})`);
+          log("portfolio", `Total: $${totalVal.toFixed(2)} | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnlPct}%)`);
+          log("portfolio", `Peak: $${state.portfolio.peakValue.toFixed(2)} | Drawdown: ${
+            state.portfolio.peakValue > 0
+              ? ((state.portfolio.peakValue - totalVal) / state.portfolio.peakValue * 100).toFixed(1)
+              : "0.0"
+          }%`);
+        }
+      }
+
+      // 5. Backfill rewards for old trades
       const scored = await backfillRewards(state, getPrice);
       if (scored > 0 && !opts.json) log("brain", `Scored ${scored} previous trade(s)`);
 
-      // 2. Adapt parameters based on trade history
+      // 6. Adapt parameters (brain learns)
       const adaptation = adaptParameters(state);
       if (!opts.json && state.trades.length >= 3) {
         log("brain", `Adaptation: ${adaptation.reason}`);
-        logAgentState(state);
       }
 
-      // 3. Observe market
+      // 7. Market sentiment + technicals
       const fear = await getFearIndex();
-      if (!opts.json) log("run", `Fear & Greed: ${fear.value}/100 (${fear.classification})`);
+      let rsi = 50;
+      let atrPct = 2.0;
+      try {
+        const candles = await getCandles("ETHUSDC", "4h", 15);
+        rsi = calcRSI(candles);
+        atrPct = calcATRPct(candles);
+      } catch {}
+      const rsiMult = rsiMultiplier(rsi);
 
-      // 4. Yield scan
-      if (!opts.json) console.log("\n── YIELD ROTATION ──");
-      await scanYield(client, { chain: 8453, top: 5, json: opts.json });
+      if (!opts.json) {
+        log("market", `Fear: ${fear.value}/100 (${fear.classification}) | RSI: ${rsi.toFixed(0)} | ATR: ${atrPct.toFixed(1)}%`);
+      }
 
-      // 5. DCA with adaptive sizing
-      if (!opts.json) console.log("\n── DCA (ADAPTIVE) ──");
-      const fearMult = fearMultiplier(fear.value);
-      const brainMult = state.adjustments.dcaAmountMultiplier;
-      const effectiveAmount = Math.round(5 * fearMult * brainMult);
+      // ── DCA BUY ──
+      if (!opts.json) console.log("\n── DCA BUY ──");
+      const baseAmount = parseFloat(opts.amount);
+      const sizing = getRecommendedSize(state, usdcBal, { fearValue: fear.value, rsi, atrPct }, baseAmount);
+      const effectiveAmount = sizing.amount;
 
-      if (brainMult === 0) {
+      if (!opts.json) {
+        for (const r of sizing.reasoning) log("dca", r);
+      }
+
+      if (sizing.paused) {
         if (!opts.json) log("dca", "⚠️  DCA PAUSED by drawdown circuit breaker");
       } else {
-        if (!opts.json) log("dca", `Fear: ${fearMult}x | Brain: ${brainMult.toFixed(2)}x | Amount: ${effectiveAmount} USDC`);
+        if (!opts.json && rsiMultiplier(rsi) === 0) {
+          log("dca", `⚠️  RSI ${rsi.toFixed(0)} > 70 — OVERBOUGHT, skipping buy`);
+        }
+
+        // Skip if RSI says overbought
+        if (rsiMult === 0 && effectiveAmount === 0) {
+          if (!opts.json) log("dca", "Skipped (overbought)");
+        }
+
         const dcaResult = await executeDCA(client, {
           token: "ETH",
           amount: String(effectiveAmount),
@@ -229,9 +385,8 @@ program.command("run").description("Run all strategies with self-improving brain
           json: opts.json,
         });
 
-        // Record trade in brain state
-        if (dcaResult.executed || dryRun) {
-          const price = dcaResult.price;
+        // Record trade in brain state (only for real executions)
+        if (dcaResult.executed) {
           recordTrade(state, {
             timestamp: new Date().toISOString(),
             strategy: "dca",
@@ -239,40 +394,49 @@ program.command("run").description("Run all strategies with self-improving brain
             chain: "base",
             amountIn: effectiveAmount,
             amountOut: parseFloat(dcaResult.toAmount || "0"),
-            priceAtEntry: price,
+            priceAtEntry: dcaResult.price,
             fearIndex: fear.value,
+            txHash: dcaResult.txHash,
           });
         }
       }
 
-      // 6. Arb scan with adaptive threshold
-      if (!opts.json) console.log("\n── ARB SCANNER (ADAPTIVE) ──");
-      const minSpread = state.adjustments.minArbSpread;
-      if (!opts.json) log("arb", `Learned min spread: ${minSpread.toFixed(2)}%`);
-      await scanArb(client, {
-        tokens: ["ETH", "SOL"],
-        chains: ["base", "arbitrum", "optimism", "ethereum"],
-        minSpread,
+      // ── GRID SELL ──
+      if (!opts.json) console.log("\n── GRID TAKE-PROFIT ──");
+      const gridResult = await checkGrid({
+        execute: !dryRun,
         json: opts.json,
+        brainState: state,
       });
 
-      // 7. Prediction scout
-      if (!opts.json) console.log("\n── PREDICTION SCOUT ──");
-      await scanPredictions(client, { top: 5, json: opts.json });
+      // 8. Refresh balances after trades
+      if (!dryRun && walletAddress) {
+        const [newUsdc, newEth] = await Promise.all([
+          getUSDCBalance(walletAddress),
+          getETHBalance(walletAddress),
+        ]);
+        if (newUsdc >= 0 && newEth >= 0) {
+          const newPrice = await getPrice("ETH");
+          updatePortfolio(state, newUsdc, newEth, newPrice);
+        }
+      }
 
-      // 8. Save brain state
+      // 9. Save brain state
       saveState(state);
 
+      // ── STATUS ──
       if (!opts.json) {
         console.log("\n── BRAIN STATUS ──");
-        log("brain", `Trades recorded: ${state.trades.length}`);
-        log("brain", `DCA multiplier: ${state.adjustments.dcaAmountMultiplier.toFixed(2)}x`);
-        log("brain", `Arb threshold: ${state.adjustments.minArbSpread.toFixed(2)}%`);
-        log("brain", `State saved to ~/.suwappu-flywheel/state.json`);
-        if (dryRun) log("run", "Add --execute to enable DCA trades.");
+        log("brain", `Trades: ${state.trades.length} | DCA mult: ${state.adjustments.dcaAmountMultiplier.toFixed(2)}x`);
+        log("brain", `Grid profit: $${gridResult.totalProfit.toFixed(2)} | Next sell: ${
+          gridResult.avgEntry > 0
+            ? `$${(gridResult.avgEntry * 1.05).toFixed(0)} (+5%)`
+            : "N/A"
+        }`);
+        log("brain", `State saved ✓`);
+        if (dryRun) log("run", "\nAdd --execute to trade live.");
       }
     } catch (e: any) {
-      // Save state even on error
       saveState(state);
       console.error(`Error: ${e.message}`);
       process.exit(1);

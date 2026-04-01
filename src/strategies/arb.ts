@@ -1,7 +1,7 @@
 import type { SuwappuClient } from "@suwappu/sdk";
 import { log, formatUsd, formatPct, logJson } from "../utils.js";
 
-interface ArbOpportunity {
+export interface ArbOpportunity {
   token: string;
   buyChain: string;
   sellChain: string;
@@ -10,6 +10,17 @@ interface ArbOpportunity {
   spreadPct: number;
   estProfitPer1K: number; // estimated profit on $1000 trade
   viable: boolean; // profitable after estimated gas+bridge fees
+}
+
+export interface ArbExecuteResult {
+  executed: boolean;
+  dryRun: boolean;
+  token: string;
+  buyChain: string;
+  amount: number;
+  toAmount?: string;
+  txHash?: string;
+  error?: string;
 }
 
 // Estimated bridge + gas costs per chain pair (conservative)
@@ -130,4 +141,74 @@ export async function scanArb(
   }
 
   return opportunities;
+}
+
+/** Execute the buy leg of an arb opportunity (buy cheap on buyChain) */
+export async function executeArb(
+  client: SuwappuClient,
+  opp: ArbOpportunity,
+  opts: { amount?: number; dryRun?: boolean; json?: boolean }
+): Promise<ArbExecuteResult> {
+  const amount = opts.amount ?? 100; // USDC to spend on buy leg
+  const dryRun = opts.dryRun ?? true;
+  const apiKey = process.env.SUWAPPU_API_KEY ?? "";
+
+  const result: ArbExecuteResult = {
+    executed: false,
+    dryRun,
+    token: opp.token,
+    buyChain: opp.buyChain,
+    amount,
+  };
+
+  try {
+    // Get quote on the cheap chain
+    const quote = await client.getQuote("USDC", opp.token, amount, opp.buyChain);
+    result.toAmount = quote.toAmount;
+
+    if (!opts.json) {
+      log("arb", `Quote: $${amount} USDC → ${quote.toAmount} ${opp.token} on ${opp.buyChain}`);
+    }
+
+    if (dryRun) {
+      if (opts.json) {
+        logJson({ strategy: "arb", action: "dry_run", ...result });
+      } else {
+        log("arb", `DRY RUN: Would buy ${quote.toAmount} ${opp.token} on ${opp.buyChain}`);
+        log("arb", `  Then bridge to ${opp.sellChain} and sell for ~${fmtProfitEst(amount, opp.spreadPct)}`);
+      }
+    } else {
+      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ quote_id: quote.id }),
+      });
+      const swap = await swapRes.json() as { tx_hash?: string; success?: boolean; error?: string };
+      if (!swap.success) throw new Error(swap.error || "Swap failed");
+      result.executed = true;
+      result.txHash = swap.tx_hash;
+
+      if (opts.json) {
+        logJson({ strategy: "arb", action: "executed_buy_leg", txHash: swap.tx_hash, ...result });
+      } else {
+        log("arb", `EXECUTED buy leg: $${amount} → ${quote.toAmount} ${opp.token} on ${opp.buyChain}`);
+        log("arb", `  TX: ${swap.tx_hash}`);
+        log("arb", `  ⚠ Bridge to ${opp.sellChain} and sell manually to complete arb`);
+      }
+    }
+  } catch (e: any) {
+    result.error = e.message;
+    if (opts.json) {
+      logJson({ strategy: "arb", action: "failed", error: e.message, ...result });
+    } else {
+      log("arb", `FAILED: ${e.message}`);
+    }
+  }
+
+  return result;
+}
+
+function fmtProfitEst(amount: number, spreadPct: number): string {
+  const profit = amount * (spreadPct / 100);
+  return formatUsd(amount + profit);
 }

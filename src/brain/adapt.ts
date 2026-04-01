@@ -21,13 +21,13 @@ export function adaptParameters(state: FlywheelState): AdaptationResult {
   };
 
   const recentTrades = state.trades.slice(-20);
-  if (recentTrades.length < 3) {
+  if (recentTrades.length < 2) {
     return result; // Need minimum data to adapt
   }
 
   const scoredTrades = recentTrades.filter((t) => t.reward !== undefined);
-  if (scoredTrades.length < 3) {
-    result.reason = `only ${scoredTrades.length}/3 trades scored — waiting for backfill`;
+  if (scoredTrades.length < 2) {
+    result.reason = `only ${scoredTrades.length}/2 trades scored — waiting for backfill`;
     return result;
   }
 

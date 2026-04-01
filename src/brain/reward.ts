@@ -1,7 +1,6 @@
 /**
  * Trade scoring — Adaptive Risk Control reward function.
  * Composite: 0.4*profit + 0.3*sharpe - 0.3*drawdown
- * Research shows this achieves Sharpe 2.47 in bear markets.
  */
 import type { TradeRecord, FlywheelState } from "./state.js";
 
@@ -10,9 +9,11 @@ export function scoreTradeReward(
   currentPrice: number,
   state: FlywheelState
 ): number {
-  // P&L percentage
-  const entryValue = trade.amountIn;
-  const currentValue = trade.amountOut * currentPrice;
+  // P&L: amountOut is tokens (ETH), convert to USD with current price
+  const entryValue = trade.amountIn; // USDC spent
+  const currentValue = trade.strategy === "grid_sell"
+    ? trade.amountOut // grid sells already return USDC
+    : trade.amountOut * currentPrice; // buys: ETH * price = USD value
   const pnlPct = entryValue > 0 ? (currentValue - entryValue) / entryValue : 0;
 
   // Rolling Sharpe contribution
@@ -23,21 +24,19 @@ export function scoreTradeReward(
     const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
     const std = Math.sqrt(variance);
     sharpeContrib = std > 0 ? (mean / std) * Math.sqrt(365) : 0;
-    sharpeContrib = Math.min(sharpeContrib, 3); // cap to prevent outliers
+    sharpeContrib = Math.min(Math.max(sharpeContrib, -3), 3); // cap both directions
   }
 
   // Drawdown penalty
   const peak = state.portfolio.peakValue;
   const current = state.portfolio.currentValue;
-  const drawdown = peak > 0 ? (peak - current) / peak : 0;
+  const drawdown = peak > 0 ? Math.max(0, (peak - current) / peak) : 0;
 
-  // Composite reward
   return 0.4 * pnlPct + 0.3 * sharpeContrib - 0.3 * drawdown;
 }
 
 /**
- * Backfill trade outcomes — call this at the start of each run
- * to score trades from previous runs using current prices.
+ * Backfill trade outcomes — score trades from previous runs using current prices.
  */
 export async function backfillRewards(
   state: FlywheelState,
@@ -46,17 +45,14 @@ export async function backfillRewards(
   let scored = 0;
 
   for (const trade of state.trades) {
-    // Only score trades that haven't been scored yet
     if (trade.reward !== undefined) continue;
 
-    // Only score trades older than 1 hour
     const ageMs = Date.now() - new Date(trade.timestamp).getTime();
-    if (ageMs < 60 * 60 * 1000) continue;
+    if (ageMs < 15 * 60 * 1000) continue; // Score trades >15min old (faster feedback loop)
 
     try {
       const currentPrice = await getCurrentPrice(trade.token);
 
-      // Backfill price
       if (!trade.priceAfter1h && ageMs >= 60 * 60 * 1000) {
         trade.priceAfter1h = currentPrice;
       }
@@ -64,19 +60,14 @@ export async function backfillRewards(
         trade.priceAfter24h = currentPrice;
       }
 
-      // Score the trade
       trade.reward = scoreTradeReward(trade, currentPrice, state);
-      trade.profitable = (trade.amountOut * currentPrice) > trade.amountIn;
-
-      // Update portfolio value
-      state.portfolio.currentValue += trade.amountOut * currentPrice - trade.amountIn;
-      if (state.portfolio.currentValue > state.portfolio.peakValue) {
-        state.portfolio.peakValue = state.portfolio.currentValue;
-      }
+      trade.profitable = trade.strategy === "grid_sell"
+        ? true // sells are always "profitable" in that they lock in gains
+        : (trade.amountOut * currentPrice) > trade.amountIn;
 
       scored++;
     } catch {
-      // Can't get price — skip for now
+      // Can't get price — skip
     }
   }
 

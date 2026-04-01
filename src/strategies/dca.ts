@@ -34,6 +34,47 @@ export function getDCAHistory(): HistoryEntry[] {
   return loadHistory();
 }
 
+/** Check USDC balance on-chain via Base RPC */
+export async function getUSDCBalance(walletAddress: string): Promise<number> {
+  const USDC = "833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+  const addr = walletAddress.replace("0x", "");
+  const data = `0x70a08231000000000000000000000000${addr}`;
+  try {
+    const res = await fetch("https://mainnet.base.org", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "eth_call",
+        params: [{ to: `0x${USDC}`, data }, "latest"],
+      }),
+    });
+    const json = await res.json() as { result: string };
+    return parseInt(json.result, 16) / 1e6; // USDC has 6 decimals
+  } catch {
+    return -1; // error — don't block on RPC failure
+  }
+}
+
+/** Check ETH balance on-chain */
+export async function getETHBalance(walletAddress: string): Promise<number> {
+  try {
+    const res = await fetch("https://mainnet.base.org", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1,
+        method: "eth_getBalance",
+        params: [walletAddress, "latest"],
+      }),
+    });
+    const json = await res.json() as { result: string };
+    return parseInt(json.result, 16) / 1e18;
+  } catch {
+    return -1;
+  }
+}
+
 interface DCAResult {
   token: string;
   price: number;
@@ -43,6 +84,9 @@ interface DCAResult {
   toAmount?: string;
   executed: boolean;
   dryRun: boolean;
+  skipped?: boolean;
+  skipReason?: string;
+  txHash?: string;
 }
 
 export async function executeDCA(
@@ -59,27 +103,39 @@ export async function executeDCA(
   const amount = opts.amount ?? "5";
   const chain = opts.chain ?? "base";
   const dryRun = opts.dryRun ?? true;
-
-  // Get current price (direct API call to avoid SDK bug with ?token= vs ?symbols=)
   const apiKey = process.env.SUWAPPU_API_KEY ?? "";
+  const walletAddress = process.env.WALLET_ADDRESS ?? "";
+
+  // Check USDC balance before trading
+  if (!dryRun && walletAddress) {
+    const usdcBal = await getUSDCBalance(walletAddress);
+    if (usdcBal >= 0 && usdcBal < parseFloat(amount)) {
+      const reason = usdcBal < 10
+        ? `USDC balance too low ($${usdcBal.toFixed(2)}) — DCA paused`
+        : `Insufficient USDC ($${usdcBal.toFixed(2)}) for $${amount} trade`;
+      if (!opts.json) log("dca", `⚠️  ${reason}`);
+      return {
+        token, price: 0, amount, chain,
+        executed: false, dryRun: false,
+        skipped: true, skipReason: reason,
+      };
+    }
+  }
+
+  // Get current price
   const priceRes = await fetch(`https://api.suwappu.bot/v1/agent/prices?symbols=${token}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   const priceData = await priceRes.json() as { prices?: Record<string, { usd: number }> };
   const price = priceData.prices?.[token]?.usd ?? 0;
 
-  if (!opts.json) {
-    log("dca", `${token}: ${formatUsd(price)}`);
-  }
+  if (!opts.json) log("dca", `${token}: ${formatUsd(price)}`);
 
   // Get quote
   const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
 
   const result: DCAResult = {
-    token,
-    price,
-    amount,
-    chain,
+    token, price, amount, chain,
     quoteId: quote.id,
     toAmount: quote.toAmount,
     executed: false,
@@ -94,20 +150,19 @@ export async function executeDCA(
       log("dca", `  Rate: 1 ${token} = ${formatUsd(price)} | Via: ${quote.dex || "auto"}`);
     }
   } else {
-    // Execute the swap
+    // Execute the swap via sign-and-send
     try {
-      // Call swap/execute directly with wallet_address (SDK doesn't pass it)
-      const walletAddress = process.env.WALLET_ADDRESS;
-      if (!walletAddress) throw new Error("WALLET_ADDRESS not set");
-      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/execute", {
+      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ quote_id: quote.id, wallet_address: walletAddress }),
+        body: JSON.stringify({ quote_id: quote.id }),
       });
-      const swap = await swapRes.json() as { txHash?: string; status?: string; swap_id?: number };
+      const swap = await swapRes.json() as { tx_hash?: string; success?: boolean; error?: string; explorer_url?: string };
+      if (!swap.success) throw new Error(swap.error || "Swap failed");
       result.executed = true;
+      result.txHash = swap.tx_hash;
 
-      // Save to history
+      // Save to DCA history
       const history = loadHistory();
       history.push({
         timestamp: new Date().toISOString(),
@@ -118,11 +173,11 @@ export async function executeDCA(
       saveHistory(history);
 
       if (opts.json) {
-        logJson({ strategy: "dca", action: "executed", txHash: swap.txHash, ...result });
+        logJson({ strategy: "dca", action: "executed", txHash: swap.tx_hash, explorer: swap.explorer_url, ...result });
       } else {
         log("dca", `EXECUTED: ${amount} USDC → ${quote.toAmount} ${token}`);
-        log("dca", `  TX: ${swap.txHash || "pending"} | Status: ${swap.status}`);
-        log("dca", `  History: ${history.length} buys recorded in ~/.suwappu-flywheel/dca-history.json`);
+        log("dca", `  TX: ${swap.tx_hash}`);
+        log("dca", `  Explorer: ${swap.explorer_url}`);
       }
     } catch (e: any) {
       if (opts.json) {
@@ -152,9 +207,9 @@ export async function getFearIndex(): Promise<{ value: number; classification: s
 
 /** Calculate DCA multiplier based on Fear & Greed Index */
 export function fearMultiplier(fearValue: number): number {
-  if (fearValue <= 10) return 4.0; // Extreme Fear → buy 4x
-  if (fearValue <= 25) return 2.0; // Fear → buy 2x
-  if (fearValue <= 50) return 1.0; // Neutral → normal
-  if (fearValue <= 75) return 0.5; // Greed → buy 0.5x
-  return 0.25;                      // Extreme Greed → buy 0.25x
+  if (fearValue <= 10) return 4.0;
+  if (fearValue <= 25) return 2.0;
+  if (fearValue <= 50) return 1.0;
+  if (fearValue <= 75) return 0.5;
+  return 0.25;
 }
