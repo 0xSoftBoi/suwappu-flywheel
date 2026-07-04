@@ -18,7 +18,7 @@
   },
   "dependencies": {
     "@suwappu/sdk": "^0.4.0",
-    "commander": "^12.0.0"
+    "commander": "^15.0.0"
   },
   "devDependencies": {
     "typescript": "^5.0.0"
