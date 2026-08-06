@@ -39,7 +39,7 @@ function getClient() {
 
 const program = new Command()
   .name("suwappu-flywheel")
-  .description("Self-sustaining multi-strategy DeFi agent — $50 minimum, $0 API cost")
+  .description("Multi-strategy DeFi agent built on the Suwappu SDK and API")
   .version("1.0.0");
 
 // ── Yield ──
