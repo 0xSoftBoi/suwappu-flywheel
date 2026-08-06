@@ -1,162 +1,128 @@
-# suwappu-flywheel
+# Suwappu Flywheel
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node.js](https://img.shields.io/badge/Bun-1.0+-orange.svg)](https://bun.sh)
+A reference multi-strategy DeFi agent built on [Suwappu](https://suwappu.bot). It shows how to compose quotes, market data, lending and prediction APIs with stateful strategies while keeping live execution behind an explicit boundary.
 
-Self-sustaining multi-strategy DeFi agent using [Suwappu](https://suwappu.bot). Start with $50 on Base. $0 API cost.
+> **Safety:** commands are scan/dry-run by default. Live DCA, grid, and scalper actions require `--execute` and use Suwappu's managed-wallet execution pipeline. Start with a test wallet and conservative wallet policies. This repository is an example, not financial advice, and is not audited.
 
-> **Warning**: This executes real DeFi transactions when dry-run is off. Use test wallets first. Not financial advice. Not audited.
+## What this example teaches
 
-## 5 Strategies, 1 Agent
+| Pattern | Where to look | Default |
+|---|---|---|
+| Swap quotes with the published TypeScript SDK | `src/strategies/dca.ts`, `src/strategies/arb.ts` | Read-only quote |
+| Lending and prediction namespaces | `src/strategies/yield.ts`, `src/strategies/predict.ts` | Read-only |
+| Managed-wallet swap submission | `src/suwappu.ts` | Only with `--execute` |
+| Stateful DCA + take-profit logic | `src/strategies/dca.ts`, `src/strategies/grid.ts` | Dry-run/check |
+| Risk guards and strategy state | `src/portfolio.ts`, `src/brain/`, `src/scalper.ts` | Local state |
 
-| Strategy | What It Does | Min Capital | Monthly Cost |
-|----------|-------------|-------------|-------------|
-| **Yield Rotation** | Auto-find best Morpho lending APY on Base | $50 | $0 |
-| **Fear-Adjusted DCA** | Buy more ETH when market is fearful | $5/buy | $0 |
-| **Arb Scanner** | Alert on cross-chain price gaps | $0 (alert-only) | $0 |
-| **Prediction Scout** | Flag mispriced Polymarket contracts | $0 (alert-only) | $0 |
-| **Run All** | Execute all strategies in one pass | $50 | $0 |
+### SDK version note
 
-## Quick Start
+This repo targets the currently published `@suwappu/sdk@0.4.x`. The `suwappubot` monorepo already contains newer 0.6.x source APIs such as managed `swap()`, `simulateSwap()`, self-custody `prepareSwap()`, wallet lifecycle, policies, approvals, audit, and kill-switch helpers, but that version is not yet published to npm.
+
+Until the matching package release lands, Flywheel keeps quote construction on the published SDK and isolates the current managed execution REST contract in `src/suwappu.ts`. That makes the version boundary visible instead of teaching code that cannot be installed from npm today.
+
+## Quick start
+
+Requirements: [Bun](https://bun.sh) 1.3+.
 
 ```bash
 git clone https://github.com/0xSoftBoi/suwappu-flywheel.git
 cd suwappu-flywheel
-bun install
+bun install --frozen-lockfile
 
-# Get a free API key
+# Register an agent. The API key is returned once; store it securely.
 curl -X POST https://api.suwappu.bot/v1/agent/register \
-  -H "Content-Type: application/json" -d '{"name":"my-flywheel"}'
+  -H "Content-Type: application/json" \
+  -d '{"name":"my-flywheel"}'
 
 export SUWAPPU_API_KEY=suwappu_sk_...
 
-# Run everything (dry-run by default)
+# Safe default: scan/quote, do not trade.
 bun run src/cli.ts run
 ```
 
-## Usage
+You do not need a private key in this project.
+
+## Commands
+
+| Command | Purpose | Live action |
+|---|---|---|
+| `yield` | Scan lending markets | None |
+| `dca` | Quote a DCA buy | `--execute` |
+| `arb` | Scan cross-chain price gaps | None |
+| `predict` | Browse prediction-market signals | None |
+| `grid` | Check take-profit levels | `--execute` |
+| `status` | API/wallet status | None |
+| `watch` | Repeat market scans | None |
+| `portfolio` | Local risk/strategy report | None |
+| `run` | Run the DCA + grid flywheel | `--execute` |
+| `scalp` | Run the mean-reversion example | `--execute` |
+
+Examples:
 
 ```bash
-# ── Yield: find best lending rates ──
-bun run src/cli.ts yield
-bun run src/cli.ts yield --top 5 --min-apy 5 --json
+# DCA — dry-run unless --execute is present
+bun run src/cli.ts dca --token ETH --amount 10
+bun run src/cli.ts dca --token ETH --amount 5 --fear-adjust
+bun run src/cli.ts dca --token ETH --amount 5 --execute
 
-# ── DCA: fear-adjusted buying ──
-bun run src/cli.ts dca --token ETH --amount 10 --dry-run
-bun run src/cli.ts dca --token ETH --amount 5 --fear-adjust --dry-run
-bun run src/cli.ts dca --token SOL --amount 5 --no-dry-run  # LIVE
-
-# ── Arb: cross-chain price scanner ──
+# Read-only scanners
+bun run src/cli.ts yield --top 5 --min-apy 5
 bun run src/cli.ts arb --tokens ETH,SOL --chains base,arbitrum,optimism
-bun run src/cli.ts arb --min-spread 0.5 --json
-
-# ── Predict: Polymarket scout ──
 bun run src/cli.ts predict --top 10
-bun run src/cli.ts predict --json
+bun run src/cli.ts watch --interval 300
 
-# ── Status: portfolio dashboard ──
-bun run src/cli.ts status
+# Grid + full flywheel
+bun run src/cli.ts grid
+bun run src/cli.ts grid --execute
+bun run src/cli.ts run
+bun run src/cli.ts run --execute
 
-# ── Run All ──
-bun run src/cli.ts run --dry-run    # safe: scan only
-bun run src/cli.ts run --no-dry-run # live: executes DCA
-bun run src/cli.ts run --json       # pipe to monitoring
+# Portfolio + scalper
+bun run src/cli.ts portfolio
+bun run src/cli.ts scalp --amount 2
+bun run src/cli.ts scalp --amount 2 --execute
 ```
 
-## Example Output
+Use `--json` on commands that expose it when another agent or monitor will consume the output.
 
-```
-╔══════════════════════════════════════════╗
-║       SUWAPPU FLYWHEEL — RUN ALL        ║
-╚══════════════════════════════════════════╝
-  Mode: DRY RUN (no trades executed)
+## Managed vs self-custody execution
 
-[14:30:01] [run] Fear & Greed: 10/100 (Extreme Fear)
-
-── YIELD ROTATION ──
-[14:30:02] [yield] Scanning Morpho markets on chain 8453...
-
-  Market                     Supply APY   Utilization   TVL
-  ──────────────────────────────────────────────────────────────
-  USDC/cbBTC                 12.50%       95.0%         $2.50M
-  USDC/WETH                  8.20%        88.5%         $5.10M
-  USDC/wstETH                5.20%        80.0%         $1.00M
-
-[14:30:02] [yield] Best: USDC/cbBTC at 12.50% APY
-[14:30:02] [yield] $100 deposited here earns ~$12.50/year
-
-── DCA ──
-[14:30:03] [dca] Fear multiplier: 4x → buying 20 USDC of ETH
-[14:30:03] [dca] ETH: $1,995.88
-[14:30:04] [dca] DRY RUN: Would buy 20 USDC → 0.01002 ETH on base
-[14:30:04] [dca]   Rate: 1 ETH = $1,995.88 | Via: Li.Fi
-
-── ARB SCANNER ──
-[14:30:05] [arb] Scanning ETH across base,arbitrum,optimism...
-  ETH prices:
-    base         $1,995.88
-    arbitrum     $1,996.12
-    optimism     $1,995.50
-[14:30:06] [arb] No spreads above 0.1% found
-
-── PREDICTION SCOUT ──
-[14:30:07] [predict] Scanning 5 prediction markets...
-
-  Will Bitcoin hit $100k by end of 2026?
-    YES: 72% | Vol: $4.2M | Ends: 2026-12-31 | Sum: 100.0%
-
-  Will the Fed cut rates in Q2 2026?
-    YES: 54% | Vol: $890K | Ends: 2026-06-30 | Sum: 100.0%
-
-[14:30:07] [predict] No obvious mispricing detected
-
-── SUMMARY ──
-[14:30:07] [run] All strategies scanned. Review above for opportunities.
-[14:30:07] [run] Remove --dry-run to enable DCA execution.
-```
-
-## How It Makes Money
-
-1. **Yield rotation** (passive) — ARMA-style lending optimization earns 8-15% APY on stablecoins by rotating between Morpho, Moonwell, and Aave based on real-time APR differentials. Even $50 benefits because Base gas is <$0.01/tx.
-
-2. **Fear-adjusted DCA** (semi-passive) — backtested to 1,145% over 7 years. Buys 4x more during Extreme Fear (currently at 10/100 — historically the best time). At $5/day base, that's $20/day during fear.
-
-3. **Arb alerts** (information) — scans cross-chain price gaps. Won't auto-execute (bridge risk), but alerts you to manual opportunities.
-
-4. **Prediction scout** (information) — finds mispriced Polymarket contracts where YES+NO ≠ 100%.
-
-## The Math
-
-| Capital | Yield (10% APY) | DCA Gains (historical) | Total | Covers Costs? |
-|---------|-----------------|----------------------|-------|---------------|
-| $50 | $5/yr | Unrealized | $5/yr | Yes ($0 cost) |
-| $100 | $10/yr | Unrealized | $10/yr | Yes |
-| $500 | $50/yr | Unrealized | $50/yr | Yes, profitably |
-| $1,000 | $100/yr | Unrealized | $100/yr | Self-sustaining |
-
-**Start small, prove it works, then scale.**
-
-## Docker
+Flywheel's live paths use Suwappu-managed wallets:
 
 ```bash
-cp .env.example .env  # edit with your API key
-docker compose up -d
-docker compose logs -f
+# Provision (or return) the managed wallet associated with this agent.
+curl -X POST https://api.suwappu.bot/v1/agent/wallets \
+  -H "Authorization: Bearer $SUWAPPU_API_KEY"
 ```
+
+Configure appropriate wallet policies before funding or enabling live strategies. Once a quote is accepted, Flywheel submits its quote id to `POST /v1/agent/swap/execute` and records the returned `swap_id` so a missing/late transaction hash is not mistaken for permission to submit the same strategy action again.
+
+For self-custody, use `POST /v1/agent/swap` to prepare an **unsigned** transaction and sign it in your own wallet. In the 0.6.x SDK source this is exposed as `prepareSwap()`. Flywheel intentionally does not embed local signing code.
+
+## Safety boundaries
+
+- No command trades merely because an API key is present; live strategy paths require `--execute`.
+- `WALLET_ADDRESS` is for portfolio/balance monitoring. It is not a private key and is not used as the managed execution wallet.
+- DCA CLI orders are capped by `SUWAPPU_MAX_TRADE_USD` (default `1000`) unless you explicitly change it.
+- The scalper also has hourly-trade, daily-loss, cooldown, and stop guards in code. Treat those as example controls, not guarantees.
+- Keep API keys out of git. Use separate agents/wallets and conservative limits while developing.
 
 ## Development
 
 ```bash
-bun install
-bun test        # 20+ tests
-bun run check   # typecheck
-bun run start   # dry-run all strategies
+bun install --frozen-lockfile
+bun run check
+bun test
 ```
+
+CI runs the same typecheck and tests without `|| true`, so a broken SDK contract fails the PR instead of being silently ignored.
 
 ## Links
 
-- [Suwappu API](https://docs.suwappu.bot) | [SDK](https://npmjs.com/package/@suwappu/sdk)
-- [Research: Profitable Agent Strategies](https://github.com/0xSoftBoi/suwappu-flywheel/wiki)
+- [Suwappu](https://suwappu.bot)
+- [Suwappu docs](https://docs.suwappu.bot)
+- [Published TypeScript SDK](https://www.npmjs.com/package/@suwappu/sdk)
+- [Suwappu SDK source](https://github.com/0xSoftBoi/suwappubot/tree/main/packages/sdk)
 
 ## License
 

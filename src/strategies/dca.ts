@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { log, formatUsd, logJson } from "../utils.js";
+import { executeManagedSwap } from "../suwappu.js";
 
 const HISTORY_DIR = join(homedir(), ".suwappu-flywheel");
 const HISTORY_FILE = join(HISTORY_DIR, "dca-history.json");
@@ -86,6 +87,8 @@ interface DCAResult {
   dryRun: boolean;
   skipped?: boolean;
   skipReason?: string;
+  swapId?: string;
+  swapStatus?: string;
   txHash?: string;
 }
 
@@ -150,19 +153,16 @@ export async function executeDCA(
       log("dca", `  Rate: 1 ${token} = ${formatUsd(price)} | Via: ${quote.dex || "auto"}`);
     }
   } else {
-    // Execute the swap via sign-and-send
+    // Submit through Suwappu's managed-wallet execution pipeline.
     try {
-      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ quote_id: quote.id }),
-      });
-      const swap = await swapRes.json() as { tx_hash?: string; success?: boolean; error?: string; explorer_url?: string };
-      if (!swap.success) throw new Error(swap.error || "Swap failed");
+      const swap = await executeManagedSwap(apiKey, quote.id);
       result.executed = true;
-      result.txHash = swap.tx_hash;
+      result.swapId = swap.swapId;
+      result.swapStatus = swap.status;
+      result.txHash = swap.txHash;
 
-      // Save to DCA history
+      // Save accepted submissions to DCA history. swapId is surfaced separately
+      // so callers can poll finality even when a tx hash is not available yet.
       const history = loadHistory();
       history.push({
         timestamp: new Date().toISOString(),
@@ -173,11 +173,19 @@ export async function executeDCA(
       saveHistory(history);
 
       if (opts.json) {
-        logJson({ strategy: "dca", action: "executed", txHash: swap.tx_hash, explorer: swap.explorer_url, ...result });
+        logJson({
+          strategy: "dca",
+          action: "submitted",
+          swapId: swap.swapId,
+          status: swap.status,
+          txHash: swap.txHash,
+          pollUrl: swap.pollUrl,
+          ...result,
+        });
       } else {
-        log("dca", `EXECUTED: ${amount} USDC → ${quote.toAmount} ${token}`);
-        log("dca", `  TX: ${swap.tx_hash}`);
-        log("dca", `  Explorer: ${swap.explorer_url}`);
+        log("dca", `SUBMITTED: ${amount} USDC → ${quote.toAmount} ${token} | Swap ${swap.swapId} (${swap.status})`);
+        if (swap.txHash) log("dca", `  TX: ${swap.txHash}`);
+        if (swap.pollUrl) log("dca", `  Status: ${swap.pollUrl}`);
       }
     } catch (e: any) {
       if (opts.json) {

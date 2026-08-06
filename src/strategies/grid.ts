@@ -15,6 +15,7 @@ import { getCandles, calcATRPct, dynamicGridLevels } from "../indicators.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { executeManagedSwap } from "../suwappu.js";
 
 const STATE_DIR = join(homedir(), ".suwappu-flywheel");
 const GRID_FILE = join(STATE_DIR, "grid-state.json");
@@ -24,6 +25,7 @@ interface GridLevel {
   sellPct: number;
   triggered: boolean;
   triggerPrice?: number;
+  swapId?: string;
   txHash?: string;
   timestamp?: string;
   // Trailing take-profit
@@ -44,7 +46,8 @@ interface GridState {
     price: number;
     ethSold: number;
     usdcReceived: number;
-    txHash: string;
+    swapId: string;
+    txHash?: string;
     level: number;
   }>;
   totalProfit: number;
@@ -260,56 +263,52 @@ export async function checkGrid(opts: {
           continue;
         }
 
-        const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ quote_id: quote.quote_id }),
+        const swap = await executeManagedSwap(apiKey, quote.quote_id);
+        const usdcReceived = parseFloat(quote.amount_out ?? "0");
+        const costBasis = ethToSell * grid.avgEntryPrice;
+        const profit = usdcReceived - costBasis;
+
+        // An accepted swapId is the idempotency boundary for this grid level.
+        // Mark it consumed even if the tx hash is not available yet so the
+        // next scan cannot submit the same sell twice.
+        level.triggered = true;
+        level.trailingActive = false;
+        level.triggerPrice = currentPrice;
+        level.swapId = swap.swapId;
+        level.txHash = swap.txHash;
+        level.timestamp = new Date().toISOString();
+
+        grid.sells.push({
+          timestamp: new Date().toISOString(),
+          price: currentPrice,
+          ethSold: ethToSell,
+          usdcReceived,
+          swapId: swap.swapId,
+          txHash: swap.txHash,
+          level: levelIdx,
         });
-        const swap = await swapRes.json() as { tx_hash?: string; success?: boolean; error?: string };
 
-        if (swap.success && swap.tx_hash) {
-          const usdcReceived = parseFloat(quote.amount_out ?? "0");
-          const costBasis = ethToSell * grid.avgEntryPrice;
-          const profit = usdcReceived - costBasis;
+        grid.totalProfit += profit;
+        grid.totalEthHeld -= ethToSell;
 
-          level.triggered = true;
-          level.trailingActive = false;
-          level.triggerPrice = currentPrice;
-          level.txHash = swap.tx_hash;
-          level.timestamp = new Date().toISOString();
-
-          grid.sells.push({
+        if (opts.brainState) {
+          recordTrade(opts.brainState, {
             timestamp: new Date().toISOString(),
-            price: currentPrice,
-            ethSold: ethToSell,
-            usdcReceived,
-            txHash: swap.tx_hash!,
-            level: levelIdx,
+            strategy: "grid_sell",
+            token: "ETH",
+            chain: "base",
+            amountIn: ethToSell,
+            amountOut: usdcReceived,
+            priceAtEntry: currentPrice,
+            fearIndex: 0,
+            txHash: swap.txHash,
           });
+        }
 
-          grid.totalProfit += profit;
-          grid.totalEthHeld -= ethToSell;
-
-          if (opts.brainState) {
-            recordTrade(opts.brainState, {
-              timestamp: new Date().toISOString(),
-              strategy: "grid_sell",
-              token: "ETH",
-              chain: "base",
-              amountIn: ethToSell,
-              amountOut: usdcReceived,
-              priceAtEntry: currentPrice,
-              fearIndex: 0,
-              txHash: swap.tx_hash,
-            });
-          }
-
-          if (!opts.json) {
-            log("grid", `  SOLD! ${ethToSellStr} ETH → ${usdcReceived.toFixed(2)} USDC | Profit: ${formatUsd(profit)}`);
-            log("grid", `  TX: ${swap.tx_hash}`);
-          }
-        } else {
-          if (!opts.json) log("grid", `  Sell failed: ${swap.error}`);
+        if (!opts.json) {
+          log("grid", `  SUBMITTED! ${ethToSellStr} ETH → ~${usdcReceived.toFixed(2)} USDC | Swap ${swap.swapId} (${swap.status})`);
+          if (swap.txHash) log("grid", `  TX: ${swap.txHash}`);
+          if (swap.pollUrl) log("grid", `  Status: ${swap.pollUrl}`);
         }
       } catch (e: any) {
         if (!opts.json) log("grid", `  Error: ${e.message}`);

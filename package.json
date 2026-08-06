@@ -5,9 +5,9 @@
   "type": "module",
   "bin": { "suwappu-flywheel": "src/cli.ts", "flywheel-tui": "src/tui.ts" },
   "scripts": {
-    "start": "bun run src/cli.ts run --config config.example.json --dry-run",
+    "start": "bun run src/cli.ts run",
     "yield": "bun run src/cli.ts yield",
-    "dca": "bun run src/cli.ts dca --dry-run",
+    "dca": "bun run src/cli.ts dca",
     "arb": "bun run src/cli.ts arb",
     "predict": "bun run src/cli.ts predict",
     "status": "bun run src/cli.ts status",
@@ -21,6 +21,7 @@
     "commander": "^12.0.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.3.14",
     "typescript": "^5.0.0"
   },
   "engines": { "node": ">=18" },

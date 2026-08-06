@@ -6,6 +6,7 @@
  */
 import { createClient } from "@suwappu/sdk";
 import { requireEnv, log } from "./utils.js";
+import { executeManagedSwap } from "./suwappu.js";
 import { calcRSI, calcATRPct } from "./indicators.js";
 import { getFearIndex } from "./strategies/dca.js";
 import { calculateKelly } from "./portfolio.js";
@@ -328,14 +329,15 @@ async function executeBuy(apiKey: string, amount: number, dryRun: boolean) {
     return { success: true, ethAmount: parseFloat(quote.toAmount), price: amount / parseFloat(quote.toAmount), txHash: "dry-run" };
   }
 
-  const res = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ quote_id: quote.id }),
-  });
-  const swap = await res.json() as { tx_hash?: string; success?: boolean; error?: string };
-  if (!swap.success) throw new Error(swap.error || "Buy failed");
-  return { success: true, ethAmount: parseFloat(quote.toAmount), price: amount / parseFloat(quote.toAmount), txHash: swap.tx_hash };
+  const swap = await executeManagedSwap(apiKey, quote.id);
+  return {
+    success: true,
+    ethAmount: parseFloat(quote.toAmount),
+    price: amount / parseFloat(quote.toAmount),
+    txHash: swap.txHash,
+    swapId: swap.swapId,
+    status: swap.status,
+  };
 }
 
 async function executeSell(apiKey: string, ethAmount: number, dryRun: boolean) {
@@ -343,21 +345,17 @@ async function executeSell(apiKey: string, ethAmount: number, dryRun: boolean) {
     return { success: true, usdcReceived: ethAmount * 2100, price: 2100, txHash: "dry-run" };
   }
 
-  const quoteRes = await fetch("https://api.suwappu.bot/v1/agent/quote", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from_token: "ETH", to_token: "USDC", amount: ethAmount.toFixed(6), chain: "base" }),
-  });
-  const quote = await quoteRes.json() as { id: string; toAmount: string };
-
-  const res = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ quote_id: quote.id }),
-  });
-  const swap = await res.json() as { tx_hash?: string; success?: boolean; error?: string };
-  if (!swap.success) throw new Error(swap.error || "Sell failed");
-  return { success: true, usdcReceived: parseFloat(quote.toAmount), price: parseFloat(quote.toAmount) / ethAmount, txHash: swap.tx_hash };
+  const client = createClient({ apiKey });
+  const quote = await client.getQuote("ETH", "USDC", ethAmount, "base");
+  const swap = await executeManagedSwap(apiKey, quote.id);
+  return {
+    success: true,
+    usdcReceived: parseFloat(quote.toAmount),
+    price: parseFloat(quote.toAmount) / ethAmount,
+    txHash: swap.txHash,
+    swapId: swap.swapId,
+    status: swap.status,
+  };
 }
 
 // ── Training data ──

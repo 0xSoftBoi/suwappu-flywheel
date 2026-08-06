@@ -1,5 +1,6 @@
 import type { SuwappuClient } from "@suwappu/sdk";
 import { log, formatUsd, formatPct, logJson } from "../utils.js";
+import { executeManagedSwap } from "../suwappu.js";
 
 export interface ArbOpportunity {
   token: string;
@@ -19,6 +20,8 @@ export interface ArbExecuteResult {
   buyChain: string;
   amount: number;
   toAmount?: string;
+  swapId?: string;
+  swapStatus?: string;
   txHash?: string;
   error?: string;
 }
@@ -178,21 +181,26 @@ export async function executeArb(
         log("arb", `  Then bridge to ${opp.sellChain} and sell for ~${fmtProfitEst(amount, opp.spreadPct)}`);
       }
     } else {
-      const swapRes = await fetch("https://api.suwappu.bot/v1/agent/swap/sign-and-send", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ quote_id: quote.id }),
-      });
-      const swap = await swapRes.json() as { tx_hash?: string; success?: boolean; error?: string };
-      if (!swap.success) throw new Error(swap.error || "Swap failed");
+      const swap = await executeManagedSwap(apiKey, quote.id);
       result.executed = true;
-      result.txHash = swap.tx_hash;
+      result.swapId = swap.swapId;
+      result.swapStatus = swap.status;
+      result.txHash = swap.txHash;
 
       if (opts.json) {
-        logJson({ strategy: "arb", action: "executed_buy_leg", txHash: swap.tx_hash, ...result });
+        logJson({
+          strategy: "arb",
+          action: "submitted_buy_leg",
+          swapId: swap.swapId,
+          status: swap.status,
+          txHash: swap.txHash,
+          pollUrl: swap.pollUrl,
+          ...result,
+        });
       } else {
-        log("arb", `EXECUTED buy leg: $${amount} → ${quote.toAmount} ${opp.token} on ${opp.buyChain}`);
-        log("arb", `  TX: ${swap.tx_hash}`);
+        log("arb", `SUBMITTED buy leg: $${amount} → ${quote.toAmount} ${opp.token} on ${opp.buyChain} | Swap ${swap.swapId} (${swap.status})`);
+        if (swap.txHash) log("arb", `  TX: ${swap.txHash}`);
+        if (swap.pollUrl) log("arb", `  Status: ${swap.pollUrl}`);
         log("arb", `  ⚠ Bridge to ${opp.sellChain} and sell manually to complete arb`);
       }
     }
