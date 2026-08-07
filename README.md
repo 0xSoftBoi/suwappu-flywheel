@@ -69,6 +69,22 @@ bun run src/cli.ts run
 
 You do not need a private key in this project.
 
+### Docker
+
+The container runs one paper/read-only Flywheel cycle and then exits. Compose
+does not restart it automatically.
+
+```bash
+docker compose run --rm flywheel
+
+# Deliberate live opt-in; configure managed-wallet policies first.
+docker compose run --rm flywheel bun run src/cli.ts run --execute
+```
+
+For scheduled automation, keep scheduling outside the container and make the
+live opt-in explicit on every configured job. `run-dca.sh` follows the same
+rule: it is paper/read-only unless you pass `--execute`.
+
 ## Commands
 
 | Command | Purpose | Live action |
