@@ -2,6 +2,8 @@ import { describe, it, expect } from "bun:test";
 import { betaSample, chooseVault, updateVaultBelief, initVaultBeliefs } from "../src/brain/bandit";
 import { defaultState, recordTrade } from "../src/brain/state";
 import type { FlywheelState } from "../src/brain/state";
+import { scoreTradeReward } from "../src/brain/reward";
+import { getRecommendedSize } from "../src/portfolio";
 
 // ── Thompson Sampling ──
 
@@ -74,11 +76,37 @@ describe("reward scoring", () => {
     const badReward = 0.4 * (-0.05) + 0.3 * (-0.5) - 0.3 * 0.2;
     expect(goodReward).toBeGreaterThan(badReward);
   });
+
+  it("scores a grid sell in USD on both sides of the trade", () => {
+    const state = defaultState();
+    const trade = recordTrade(state, {
+      timestamp: new Date().toISOString(),
+      strategy: "grid_sell",
+      token: "ETH",
+      chain: "base",
+      amountIn: 1,
+      amountOut: 2100,
+      priceAtEntry: 2000,
+      fearIndex: 50,
+    });
+    expect(scoreTradeReward(trade, 2100, state)).toBeCloseTo(0.02, 6);
+  });
 });
 
 // ── Adaptive Parameters ──
 
 describe("adaptive parameters", () => {
+  it("keeps an RSI no-trade signal at a zero dollar size", () => {
+    const sizing = getRecommendedSize(
+      defaultState(),
+      100,
+      { fearValue: 50, rsi: 80, atrPct: 2 },
+      5,
+    );
+    expect(sizing.marketAdjustment).toBe(0);
+    expect(sizing.amount).toBe(0);
+  });
+
   it("winning streak increases DCA multiplier", () => {
     const mult = 1.0;
     const newMult = Math.min(2.0, mult * 1.1);
