@@ -1,6 +1,5 @@
 import type { SuwappuClient } from "@suwappu/sdk";
 import { log, formatUsd, formatPct, logJson } from "../utils.js";
-import { executeManagedSwap } from "../suwappu.js";
 
 export interface ArbOpportunity {
   token: string;
@@ -10,7 +9,7 @@ export interface ArbOpportunity {
   sellPrice: number;
   spreadPct: number;
   estProfitPer1K: number; // estimated profit on $1000 trade
-  viable: boolean; // profitable after estimated gas+bridge fees
+  viable: boolean; // positive under this scanner's estimate; not a realized/executable profit claim
 }
 
 export interface ArbExecuteResult {
@@ -44,6 +43,21 @@ const BRIDGE_COST_USD: Record<string, number> = {
 
 function getBridgeCost(from: string, to: string): number {
   return BRIDGE_COST_USD[`${from}→${to}`] ?? 2.0;
+}
+
+export function calculateSpreadPct(buyPrice: number, sellPrice: number): number {
+  return ((sellPrice - buyPrice) / buyPrice) * 100;
+}
+
+export function estimateArbNetUsd(
+  tradeSize: number,
+  spreadPct: number,
+  buyChain: string,
+  sellChain: string,
+  slippageFraction = 0.003,
+): number {
+  const grossProfit = tradeSize * (spreadPct / 100);
+  return grossProfit - getBridgeCost(buyChain, sellChain) - tradeSize * slippageFraction;
 }
 
 export async function scanArb(
@@ -93,13 +107,15 @@ export async function scanArb(
     for (let i = 0; i < chainPrices.length; i++) {
       for (let j = 0; j < chainPrices.length; j++) {
         if (i === j) continue;
-        const spread = ((chainPrices[j].price - chainPrices[i].price) / chainPrices[i].price) * 100;
+        const spread = calculateSpreadPct(chainPrices[i].price, chainPrices[j].price);
         if (spread >= minSpread) {
           const tradeSize = 1000;
-          const grossProfit = tradeSize * (spread / 100);
-          const bridgeCost = getBridgeCost(chainPrices[i].chain, chainPrices[j].chain);
-          const slippage = tradeSize * 0.003; // ~0.3% slippage estimate
-          const netProfit = grossProfit - bridgeCost - slippage;
+          const netProfit = estimateArbNetUsd(
+            tradeSize,
+            spread,
+            chainPrices[i].chain,
+            chainPrices[j].chain,
+          );
 
           const opp: ArbOpportunity = {
             token,
@@ -127,19 +143,19 @@ export async function scanArb(
       const viable = opportunities.filter((o) => o.viable);
       const notViable = opportunities.filter((o) => !o.viable);
 
-      log("arb", `Found ${opportunities.length} spreads (${viable.length} profitable after fees):`);
+      log("arb", `Found ${opportunities.length} spreads (${viable.length} positive under the cost model):`);
       for (const o of opportunities.sort((a, b) => b.estProfitPer1K - a.estProfitPer1K)) {
         const profitStr = o.viable
-          ? `✅ Net: ${formatUsd(o.estProfitPer1K)}/1K`
-          : `❌ Net: ${formatUsd(o.estProfitPer1K)}/1K (fees eat profit)`;
+          ? `EST +: ${formatUsd(o.estProfitPer1K)}/1K`
+          : `EST -: ${formatUsd(o.estProfitPer1K)}/1K`;
         console.log(`    ${o.token}: ${o.buyChain} → ${o.sellChain} | Spread: ${formatPct(o.spreadPct)} | ${profitStr}`);
       }
       console.log();
       if (viable.length > 0) {
         const best = viable[0];
-        log("arb", `💰 Best: ${best.token} ${best.buyChain}→${best.sellChain} nets ${formatUsd(best.estProfitPer1K)} per $1K traded`);
+        log("arb", `Best model estimate: ${best.token} ${best.buyChain}→${best.sellChain} ${formatUsd(best.estProfitPer1K)} per $1K before unmodeled execution risk`);
       }
-      log("arb", "Note: Bridge time 1-15min. Prices may move. Slippage estimated at 0.3%.");
+      log("arb", "Estimate only: hard-coded bridge/gas costs + 0.3% slippage; excludes quote expiry, fill drift, bridge latency/failure, and second-leg execution.");
     }
   }
 
@@ -154,7 +170,6 @@ export async function executeArb(
 ): Promise<ArbExecuteResult> {
   const amount = opts.amount ?? 100; // USDC to spend on buy leg
   const dryRun = opts.dryRun ?? true;
-  const apiKey = process.env.SUWAPPU_API_KEY ?? "";
 
   const result: ArbExecuteResult = {
     executed: false,
@@ -181,28 +196,14 @@ export async function executeArb(
         log("arb", `  Then bridge to ${opp.sellChain} and sell for ~${fmtProfitEst(amount, opp.spreadPct)}`);
       }
     } else {
-      const swap = await executeManagedSwap(apiKey, quote.id);
-      result.executed = true;
-      result.swapId = swap.swapId;
-      result.swapStatus = swap.status;
-      result.txHash = swap.txHash;
-
-      if (opts.json) {
-        logJson({
-          strategy: "arb",
-          action: "submitted_buy_leg",
-          swapId: swap.swapId,
-          status: swap.status,
-          txHash: swap.txHash,
-          pollUrl: swap.pollUrl,
-          ...result,
-        });
-      } else {
-        log("arb", `SUBMITTED buy leg: $${amount} → ${quote.toAmount} ${opp.token} on ${opp.buyChain} | Swap ${swap.swapId} (${swap.status})`);
-        if (swap.txHash) log("arb", `  TX: ${swap.txHash}`);
-        if (swap.pollUrl) log("arb", `  Status: ${swap.pollUrl}`);
-        log("arb", `  ⚠ Bridge to ${opp.sellChain} and sell manually to complete arb`);
-      }
+      // This repository does not implement an atomic/two-leg arb executor. A
+      // one-leg "execute" teaches the dangerous failure mode (inventory risk)
+      // while pretending the scanner's estimate is realizable, so keep it
+      // quote-only until both legs, bridging, reconciliation, and unwind logic
+      // are modeled as one durable workflow.
+      result.error = "Live arb is intentionally disabled: this example scans estimates but does not implement a reconciled two-leg/bridge workflow";
+      if (opts.json) logJson({ strategy: "arb", action: "execution_disabled", ...result });
+      else log("arb", `NOT EXECUTED: ${result.error}`);
     }
   } catch (e: any) {
     result.error = e.message;
