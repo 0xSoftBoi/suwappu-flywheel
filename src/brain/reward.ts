@@ -9,8 +9,10 @@ export function scoreTradeReward(
   currentPrice: number,
   state: FlywheelState
 ): number {
-  // P&L: amountOut is tokens (ETH), convert to USD with current price
-  const entryValue = trade.amountIn; // USDC spent
+  // Keep both sides in USD. Grid amountIn is ETH; DCA amountIn is USDC.
+  const entryValue = trade.strategy === "grid_sell"
+    ? trade.amountIn * trade.priceAtEntry
+    : trade.amountIn;
   const currentValue = trade.strategy === "grid_sell"
     ? trade.amountOut // grid sells already return USDC
     : trade.amountOut * currentPrice; // buys: ETH * price = USD value
@@ -62,7 +64,7 @@ export async function backfillRewards(
 
       trade.reward = scoreTradeReward(trade, currentPrice, state);
       trade.profitable = trade.strategy === "grid_sell"
-        ? true // sells are always "profitable" in that they lock in gains
+        ? trade.amountOut > trade.amountIn * trade.priceAtEntry
         : (trade.amountOut * currentPrice) > trade.amountIn;
 
       scored++;
