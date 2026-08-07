@@ -5,10 +5,14 @@ interface PredictAlert {
   question: string;
   yesPrice: number;
   noPrice: number;
-  mispricing: number; // |yesPrice + noPrice - 1.00|
+  mispricing: number; // legacy field name: absolute YES+NO price-sum deviation, not guaranteed edge
   volume: string;
   endDate: string;
   category: string;
+}
+
+export function predictionPriceSumDeviation(yesPrice: number, noPrice: number): number {
+  return Math.abs(yesPrice + noPrice - 1.0);
 }
 
 export async function scanPredictions(
@@ -21,8 +25,7 @@ export async function scanPredictions(
 
   for (const m of markets) {
     const [yesPrice, noPrice] = m.outcomePrices;
-    const sum = yesPrice + noPrice;
-    const mispricing = Math.abs(sum - 1.0);
+    const mispricing = predictionPriceSumDeviation(yesPrice, noPrice);
     const volume = m.volume > 1e6
       ? `${(m.volume / 1e6).toFixed(1)}M`
       : `${(m.volume / 1e3).toFixed(0)}K`;
@@ -38,7 +41,8 @@ export async function scanPredictions(
     });
   }
 
-  // Sort by mispricing (structural arb potential)
+  // Sort by price-sum deviation. Spread, fees, stale books, and execution can
+  // all create a deviation without creating a realizable arbitrage.
   alerts.sort((a, b) => b.mispricing - a.mispricing);
 
   if (opts.json) {
@@ -50,18 +54,18 @@ export async function scanPredictions(
     for (const a of alerts) {
       const yPct = (a.yesPrice * 100).toFixed(0);
       const sumPct = ((a.yesPrice + a.noPrice) * 100).toFixed(1);
-      const flag = a.mispricing > 0.02 ? " ⚠ MISPRICED" : "";
+      const flag = a.mispricing > 0.02 ? " ⚠ PRICE-SUM DEVIATION" : "";
 
       console.log(`  ${a.question}`);
       console.log(`    YES: ${yPct}% | Vol: ${a.volume} | Ends: ${a.endDate} | Sum: ${sumPct}%${flag}`);
       console.log();
     }
 
-    const mispriced = alerts.filter((a) => a.mispricing > 0.02);
-    if (mispriced.length > 0) {
-      log("predict", `${mispriced.length} markets with YES+NO sum ≠ 100% (potential structural arb)`);
+    const deviating = alerts.filter((a) => a.mispricing > 0.02);
+    if (deviating.length > 0) {
+      log("predict", `${deviating.length} markets with YES+NO sum more than 2% from 100%; treat this as a screening signal, not executable edge`);
     } else {
-      log("predict", "No obvious mispricing detected — markets are efficient");
+      log("predict", "No YES+NO price-sum deviations above 2% in this sample");
     }
   }
 
