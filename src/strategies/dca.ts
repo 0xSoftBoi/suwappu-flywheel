@@ -261,6 +261,8 @@ export async function executeDCA(
     } else if (intent.phase === "outcome_unknown") {
       log("dca", `OUTCOME UNKNOWN: intent ${intent.id}. The same idempotency key will be reused; do not create a replacement trade.`);
       if (intent.error) log("dca", `  ${intent.error}`);
+    } else if (intent.phase === "completed") {
+      log("dca", `COMPLETED swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; accounting remains on hold until reconciliation returns them.`);
     } else {
       log("dca", `SUBMITTED: intent ${intent.id}${intent.swapId ? ` | Swap ${intent.swapId}` : ""} (${intent.swapStatus ?? intent.phase})`);
       log("dca", "  Not counted as a fill yet; rerun to reconcile status.");
