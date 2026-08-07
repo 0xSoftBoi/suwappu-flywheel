@@ -1,7 +1,7 @@
 {
   "name": "suwappu-flywheel",
   "version": "1.0.0",
-  "description": "Self-sustaining multi-strategy DeFi agent — yield rotation, fear-DCA, grid bot, airdrop farming, prediction scout",
+  "description": "Suwappu strategy lab — read-only market screens, paper strategies, and outcome-safe managed execution",
   "type": "module",
   "bin": { "suwappu-flywheel": "src/cli.ts", "flywheel-tui": "src/tui.ts" },
   "scripts": {
