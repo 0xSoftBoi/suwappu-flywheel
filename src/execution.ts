@@ -99,7 +99,10 @@ function saveEntry(entry: ExecutionIntent): void {
   entry.updatedAt = new Date().toISOString();
   if (index >= 0) entries[index] = entry;
   else entries.push(entry);
-  saveJournal(entries.slice(-500));
+  // Never prune unresolved economic intents just to cap file size. Losing an
+  // old pending/outcome-unknown idempotency key is worse than a larger local
+  // journal because it can turn a retry into a new economic action.
+  saveJournal(entries);
 }
 
 function sameTerms(a: EconomicTerms, b: EconomicTerms): boolean {
