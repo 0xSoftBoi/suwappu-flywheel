@@ -2,9 +2,9 @@
  * Persistent state for the self-improving flywheel agent.
  * Single source of truth — loaded at startup, saved after every run cycle.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { readJsonFile, writeJsonAtomic } from "../storage.js";
 
 const STATE_DIR = join(homedir(), ".suwappu-flywheel");
 
@@ -35,6 +35,7 @@ export interface TradeRecord {
   intentId?: string;
   swapId?: string;
   // Backfilled later:
+  priceAfter15m?: number;
   priceAfter1h?: number;
   priceAfter24h?: number;
   reward?: number;
@@ -47,7 +48,7 @@ export interface VaultBelief {
 }
 
 export interface FlywheelState {
-  version: 1;
+  version: 2;
   lastRun: string;
   trades: TradeRecord[];
   beliefs: {
@@ -68,13 +69,16 @@ export interface FlywheelState {
     ethBalance: number;
     currentValue: number;
     peakValue: number;
+    peakValueAt?: string;
+    maxDrawdownObserved: number;
+    /** Last 30 evaluated trade-return observations (legacy field name). */
     rollingReturns30d: number[];
   };
 }
 
 export function defaultState(): FlywheelState {
   return {
-    version: 1,
+    version: 2,
     lastRun: new Date().toISOString(),
     trades: [],
     beliefs: {
@@ -95,30 +99,43 @@ export function defaultState(): FlywheelState {
       ethBalance: 0,
       currentValue: 0,
       peakValue: 0,
+      maxDrawdownObserved: 0,
       rollingReturns30d: [],
     },
   };
 }
 
+function isStateShape(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const state = value as { trades?: unknown; portfolio?: unknown };
+  return Array.isArray(state.trades) && !!state.portfolio && typeof state.portfolio === "object";
+}
+
 export function loadState(): FlywheelState {
-  try {
-    if (existsSync(configuredStateFile())) {
-      const state = JSON.parse(readFileSync(configuredStateFile(), "utf-8")) as FlywheelState;
-      // Ensure new fields exist (backward compat)
-      if (!state.portfolio.startingCapital) state.portfolio.startingCapital = 50;
-      if (state.portfolio.usdcBalance === undefined) state.portfolio.usdcBalance = 0;
-      if (state.portfolio.ethBalance === undefined) state.portfolio.ethBalance = 0;
-      return state;
-    }
-  } catch {}
-  return defaultState();
+  const state = readJsonFile(
+    configuredStateFile(),
+    defaultState,
+    isStateShape,
+  ) as FlywheelState & { version: number; portfolio: FlywheelState["portfolio"] };
+
+  // Backward-compatible migration from v1 state. Existing files are upgraded
+  // in memory and written on the next normal save; corrupt files fail closed.
+  state.version = 2;
+  if (!state.portfolio.startingCapital) state.portfolio.startingCapital = 50;
+  if (state.portfolio.usdcBalance === undefined) state.portfolio.usdcBalance = 0;
+  if (state.portfolio.ethBalance === undefined) state.portfolio.ethBalance = 0;
+  if (state.portfolio.maxDrawdownObserved === undefined) {
+    const peak = state.portfolio.peakValue ?? 0;
+    const current = state.portfolio.currentValue ?? 0;
+    state.portfolio.maxDrawdownObserved = peak > 0 ? Math.max(0, (peak - current) / peak) : 0;
+  }
+  if (!Array.isArray(state.portfolio.rollingReturns30d)) state.portfolio.rollingReturns30d = [];
+  return state;
 }
 
 export function saveState(state: FlywheelState): void {
-  const dir = configuredStateDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   state.lastRun = new Date().toISOString();
-  writeFileSync(configuredStateFile(), JSON.stringify(state, null, 2));
+  writeJsonAtomic(configuredStateFile(), state);
 }
 
 export function recordTrade(
@@ -132,14 +149,11 @@ export function recordTrade(
   };
   state.trades.push(record);
 
-  // Update portfolio tracking
+  // Update portfolio tracking. A DCA buy does not have a strategy return at
+  // fill time; its evaluated return is added only after a later price is
+  // observed by backfillRewards().
   if (trade.strategy === "dca") {
     state.portfolio.totalInvested += trade.amountIn;
-    // PnL: how much USD value we got vs what we paid
-    const returnPct = trade.priceAtEntry > 0
-      ? (trade.amountOut * trade.priceAtEntry - trade.amountIn) / trade.amountIn
-      : 0;
-    state.portfolio.rollingReturns30d.push(returnPct);
   } else if (trade.strategy === "grid_sell") {
     // Sells return USDC — amountOut is USDC received
     const returnPct = trade.amountIn > 0
@@ -162,9 +176,7 @@ export function recordTrade(
  */
 export function syncFromDCAHistory(state: FlywheelState): number {
   let synced = 0;
-  try {
-    if (!existsSync(configuredDcaHistoryFile())) return 0;
-    const history = JSON.parse(readFileSync(configuredDcaHistoryFile(), "utf-8")) as Array<{
+  const history = readJsonFile(configuredDcaHistoryFile(), () => [], Array.isArray) as Array<{
       timestamp: string;
       token: string;
       amount: string;
@@ -221,7 +233,6 @@ export function syncFromDCAHistory(state: FlywheelState): number {
       state.portfolio.totalInvested += parseFloat(entry.amount);
       synced++;
     }
-  } catch {}
   return synced;
 }
 
@@ -239,5 +250,9 @@ export function updatePortfolio(
   state.portfolio.currentValue = usdcBalance + ethBalance * ethPrice;
   if (state.portfolio.currentValue > state.portfolio.peakValue) {
     state.portfolio.peakValue = state.portfolio.currentValue;
+    state.portfolio.peakValueAt = new Date().toISOString();
   }
+  const peak = state.portfolio.peakValue;
+  const drawdown = peak > 0 ? Math.max(0, (peak - state.portfolio.currentValue) / peak) : 0;
+  state.portfolio.maxDrawdownObserved = Math.max(state.portfolio.maxDrawdownObserved, drawdown);
 }

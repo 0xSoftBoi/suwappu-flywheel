@@ -1,12 +1,12 @@
 # Suwappu Flywheel
 
-A strategy lab and builder reference for [Suwappu](https://suwappu.bot). It shows how to combine quotes, prices, lending, prediction markets, local strategy state, paper trading, and explicit managed-wallet execution without teaching that a submitted transaction is already a fill.
+A standalone strategy-operations product and builder kit for [Suwappu](https://suwappu.bot). Flywheel gives power users a paper-first CLI/TUI for market screens, DCA/grid/scalper workflows, portfolio analysis, and explicit managed-wallet execution with a durable intent journal.
 
-> **Safety:** scan/paper mode is the default. Live DCA, grid, and scalper actions require `--execute`. This repository is an example, not financial advice, and is not audited. Use a separate test wallet and conservative policies before putting real value at risk.
+> **Safety:** scan/paper mode is the default. Live DCA, grid, and scalper actions require `--execute`. Enterprise-operable does not mean security-audited or profitable, and nothing here is financial advice. Use a dedicated test agent/wallet and conservative policies before putting real value at risk.
 
-## Why this repo exists
+## What the product does
 
-Flywheel is deliberately smaller than a full trading framework. Its job is to make Suwappu integration patterns easy to copy into a product:
+Flywheel is deliberately smaller than a full trading framework. It is useful directly as a single-operator strategy workspace and as production-oriented reference code for a larger Suwappu product:
 
 | Builder pattern | Where to look | Money-moving by default? |
 |---|---|---|
@@ -16,6 +16,8 @@ Flywheel is deliberately smaller than a full trading framework. Its job is to ma
 | DCA + take-profit composition | `src/strategies/dca.ts`, `src/strategies/grid.ts` | Paper/check by default |
 | Paper vs live scalper state | `src/scalper.ts` | Separate ledgers |
 | Risk/evaluation state | `src/portfolio.ts`, `src/brain/` | Local computation |
+| Fail-closed durable state | `src/storage.ts` | Protects local ledgers from silent reset |
+| Operations / incident recovery | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Operator control plane |
 | Turn the patterns into a product | [`BUILDING_A_PRODUCT.md`](BUILDING_A_PRODUCT.md) | Start read-only |
 
 The live lifecycle is intentionally explicit:
@@ -32,7 +34,7 @@ A timeout/5xx can leave the on-chain outcome unknown. Flywheel reuses the persis
 
 ## Where this fits vs mature trading OSS
 
-If you need a mature exchange-trading framework, use one. [Freqtrade](https://www.freqtrade.io/en/stable/strategy-101/) documents backtesting, dry-run/forward testing, and strategy analysis; [Hummingbot](https://github.com/hummingbot/hummingbot) provides a broader algorithmic-trading framework and connector ecosystem.
+If you need a mature exchange-trading framework, use one. [Freqtrade](https://www.freqtrade.io/en/stable/strategy-customization/) runs the same strategy concept through backtesting, dry/forward testing, and live modes and also ships a [lookahead-bias analysis](https://www.freqtrade.io/en/stable/lookahead-analysis/). [Hummingbot](https://hummingbot.org/docs/) provides a broader connector/strategy platform whose V2 controllers support backtesting and multi-bot deployment.
 
 Flywheel is not trying to duplicate those projects. It is the compact Suwappu-specific layer to study when you need Suwappu market surfaces and managed execution in your own app.
 
@@ -43,13 +45,13 @@ Flywheel is not trying to duplicate those projects. It is the compact Suwappu-sp
 | Durable Suwappu intent + reconciliation example | Yes | N/A |
 | Historical backtesting engine | No | Common |
 | Exchange connector framework | No | Common |
-| Fill/order database + production observability | Reference journal only | Much deeper |
+| Fill/order database + production observability | Durable single-writer journal + metadata events | Much deeper |
 
 Treat Flywheel's strategy results as examples to evaluate, not evidence of a profitable strategy.
 
 ## Quick start
 
-Requirements: [Bun](https://bun.sh) 1.3+.
+Requirements: [Bun](https://bun.sh) 1.3.14+ (CI is pinned to 1.3.14).
 
 ```bash
 git clone https://github.com/0xSoftBoi/suwappu-flywheel.git
@@ -71,8 +73,11 @@ You do not need a private key in this project.
 
 ### Docker
 
-The container runs one paper/read-only Flywheel cycle and then exits. Compose
-does not restart it automatically.
+The container runs as a non-root user, mounts the named `flywheel_state` volume
+at `/data`, runs one paper/read-only Flywheel cycle, and then exits. Compose
+does not restart it automatically. The named volume is important: execution
+intents must survive `docker compose run --rm` so a retry cannot forget its
+idempotency key.
 
 ```bash
 docker compose run --rm flywheel
@@ -83,7 +88,9 @@ docker compose run --rm flywheel bun run src/cli.ts run --execute
 
 For scheduled automation, keep scheduling outside the container and make the
 live opt-in explicit on every configured job. `run-dca.sh` follows the same
-rule: it is paper/read-only unless you pass `--execute`.
+rule: it is paper/read-only unless you pass `--execute`. Back up the state
+volume before live upgrades; do not remove the volume while unresolved intents
+exist. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ## Commands
 
@@ -157,6 +164,7 @@ For self-custody, use `POST /v1/agent/swap` to prepare an **unsigned** transacti
 - The scalper's default mode is **paper**, and paper state lives in `scalper-paper-state.json`. Live state lives separately in `scalper-live-state.json`.
 - Paper exits use a fresh Suwappu quote. They are still simulations, not observed fills.
 - DCA/grid accounting consumes only reconciled terminal successes and final status amounts. Quote output is preserved as an estimate, not relabeled as a fill.
+- DCA learning records a later observed price (15m, then 1h, then 24h as those windows mature). Kelly/attribution uses the most mature observed return, never the entry-price quote discrepancy as if it were later P&L.
 - Pre-upgrade DCA/grid rows were recorded at submission time and therefore cannot prove finality. The current code excludes those legacy rows from verified accounting instead of silently trusting them.
 - The arb scanner's bridge/gas/slippage model is a **screening estimate**. It does not model an atomic two-leg workflow, so live arb execution is intentionally disabled.
 - Prediction `YES + NO` deviation is a screening signal, not guaranteed arbitrage; spread, fees, stale books, and execution matter.
@@ -190,20 +198,24 @@ Until 0.6.x is published, Flywheel keeps quote construction on the installable S
 - Every live intent persists a server-compatible idempotency key before submission.
 - Known pending swaps are reconciled instead of resubmitted.
 - Outcome-unknown requests keep the same intent; do not create a replacement economic action.
-- DCA CLI orders are capped by `SUWAPPU_MAX_TRADE_USD` (default `1000`) unless you deliberately change it.
+- HTTP 408, transport failure, timeout, 5xx, or a malformed managed-execution success are outcome-unknown after submission begins.
+- DCA and scalper buys are capped by `SUWAPPU_MAX_TRADE_USD` (default `1000`) unless you deliberately change it; invalid live cap configuration fails closed.
+- The scalper never invents an account balance for Kelly sizing. Set `SUWAPPU_SCALPER_USDC_BUDGET` only when you want percentage sizing against an explicit strategy budget.
 - The scalper has hourly-trade, daily-loss, cooldown, and stop guards. They are example controls, not guarantees.
-- Run one live worker per local state directory; the JSON journal is a reference implementation, not a distributed lock/database.
+- Existing financial state is never silently replaced when JSON is corrupt. Authoritative state files are atomically replaced with restrictive file permissions.
+- Run one live writer per state directory/volume. Managed submission takes an exclusive local `execution.lock` so an overlapping writer fails closed; this is still not a distributed lock/database or a scheduler-level dedupe key.
 - Keep API keys out of git. Use separate agents/wallets and conservative limits while developing.
+
+For managed REST calls, Flywheel uses a 25-second operation deadline by default (`SUWAPPU_OPERATION_TIMEOUT_MS`, max 30 seconds). Set `SUWAPPU_API_EVENTS=1` to emit metadata-only operation/outcome/duration/status events to stderr; these events exclude credentials, wallet addresses, quote/swap IDs, bodies, and error messages.
 
 ## Development
 
 ```bash
 bun install --frozen-lockfile
-bun run check
-bun test
+bun run verify
 ```
 
-CI uses pinned Bun and runs the same typecheck/tests without `|| true`. The execution tests cover idempotent retry, pending-swap reconciliation, and quote-vs-final amount separation.
+CI pins Bun, runs typecheck/tests/build/CLI smoke checks, audits high/critical dependency advisories, validates/builds the container contract, and runs CodeQL. Execution tests cover idempotent retry, pending-swap reconciliation, 408 ambiguity, corrupt-journal fail-closed behavior, and quote-vs-final amount separation.
 
 ## Links
 

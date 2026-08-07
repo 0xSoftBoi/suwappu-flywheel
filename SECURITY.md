@@ -1,9 +1,10 @@
 # Security Policy
 
-This repository is a satellite / example application built on the
-[Suwappu API](https://github.com/0xSoftBoi/suwappubot). Some examples can
-initiate real financial transactions when execution is enabled. Treat API keys,
-wallet credentials, and configuration as sensitive.
+This repository is a standalone strategy-operations application built on the
+[Suwappu API](https://github.com/0xSoftBoi/suwappubot). DCA, grid, and scalper
+workflows can initiate real managed-wallet transactions when `--execute` is
+enabled. Treat API keys, wallet policy, execution state, backups, and customer
+strategy data as sensitive.
 
 ## Reporting a vulnerability
 
@@ -23,10 +24,53 @@ upstream through the
 
 ## Custody and execution model
 
-Suwappu supports both self-custody and custodial product flows. This satellite
-repository does not make a custody guarantee: behavior depends on the API mode
-and configuration in use. Prefer dry-run or read-only modes where available,
-use test wallets before enabling execution, and never commit credentials.
+Flywheel's live paths use the Suwappu-managed wallet attached to the agent API
+key. Strategy code must not receive a private signing key. Self-custody is a
+separate flow: prepare an unsigned transaction and let the user's wallet review
+and sign it.
+
+Every managed action must keep the following boundary:
+
+1. obtain a fresh quote;
+2. simulate it;
+3. persist one economic intent and idempotency key;
+4. submit once;
+5. reconcile status; and
+6. account only terminal-success final amounts.
+
+Timeout/network failure, HTTP 408/5xx, or a malformed successful submission
+can mean the outcome is unknown. Preserve the intent/key and reconcile before
+creating any replacement action.
+
+## Durable-state boundary
+
+The execution journal and live strategy files are financial operational state.
+Existing corrupt JSON fails closed and authoritative writes use atomic
+replacement. Never respond to a state error by deleting the file and rerunning
+live automation.
+
+The local store supports one live writer per state directory/volume. Managed
+submission uses an exclusive local `execution.lock`; a stale lock after an
+abnormal exit is a stop condition until the journal is reconciled. For
+multi-worker services, move the state machine to a transactional database with
+unique intent constraints and locking/leases.
+
+Compose persists `/data` in the `flywheel_state` named volume so disposable
+containers do not discard idempotency/reconciliation state. Back up that volume
+before live upgrades and keep state backups protected from unauthorized access.
+
+## Logging and dependencies
+
+`SUWAPPU_API_EVENTS=1` emits only operation/outcome/duration/status metadata.
+Do not add API keys, wallet addresses, quote/swap IDs, request/response bodies,
+strategy inputs, or raw error bodies to this event stream.
+
+CI blocks high/critical advisories reported by `bun audit`, builds the container
+contract, and runs CodeQL. Dependabot remains enabled for npm and GitHub Actions.
+Re-evaluate advisories rather than adding broad permanent ignores.
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the deployment contract,
+release gates, retry matrix, backups, and live-money incident runbook.
 
 ## Our commitment
 

@@ -6,6 +6,42 @@
  * the money-moving managed execution boundary.
  */
 const API_BASE_URL = process.env.SUWAPPU_API_URL ?? "https://api.suwappu.bot";
+const DEFAULT_OPERATION_TIMEOUT_MS = 25_000;
+const MAX_OPERATION_TIMEOUT_MS = 30_000;
+
+export function operationTimeoutMs(): number {
+  const raw = process.env.SUWAPPU_OPERATION_TIMEOUT_MS ?? String(DEFAULT_OPERATION_TIMEOUT_MS);
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < 100 || value > MAX_OPERATION_TIMEOUT_MS) {
+    throw new Error("SUWAPPU_OPERATION_TIMEOUT_MS must be between 100 and 30000 milliseconds");
+  }
+  return value;
+}
+
+function emitApiEvent(
+  operation: string,
+  outcome: "success" | "http_error" | "protocol_error" | "timeout" | "network_error",
+  startedAt: number,
+  status?: number,
+): void {
+  if (!/^(1|true)$/i.test(process.env.SUWAPPU_API_EVENTS ?? "")) return;
+  const event: Record<string, string | number> = {
+    operation,
+    outcome,
+    duration_ms: Math.round((performance.now() - startedAt) * 10) / 10,
+  };
+  if (status !== undefined) event.status = status;
+  // Deliberately no credentials, wallet addresses, quote/swap IDs, request or
+  // response bodies, error messages, or strategy inputs.
+  console.error(`suwappu_api_event ${JSON.stringify(event)}`);
+}
+
+async function fetchWithDeadline(input: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    signal: AbortSignal.timeout(operationTimeoutMs()),
+  });
+}
 
 export interface ManagedSwapResult {
   swapId: string;
@@ -110,28 +146,45 @@ export async function simulateManagedSwap(
 ): Promise<ManagedSwapSimulation> {
   if (!apiKey) throw new Error("SUWAPPU_API_KEY is required for swap simulation");
 
-  const response = await fetch(`${API_BASE_URL}/v1/agent/swap/simulate`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      quote_id: quoteId,
-      ...(walletAddress ? { wallet_address: walletAddress } : {}),
-    }),
-  });
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetchWithDeadline(`${API_BASE_URL}/v1/agent/swap/simulate`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        quote_id: quoteId,
+        ...(walletAddress ? { wallet_address: walletAddress } : {}),
+      }),
+    });
+  } catch (error) {
+    const timeout = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    emitApiEvent("simulate_swap", timeout ? "timeout" : "network_error", startedAt);
+    throw new ManagedSwapRequestError(
+      `Swap simulation ${timeout ? "timed out" : "transport failed"}`,
+    );
+  }
   const body = await readJson<SimulationResponse>(response);
   if (!response.ok) {
+    emitApiEvent("simulate_swap", "http_error", startedAt, response.status);
     throw new ManagedSwapRequestError(
       errorMessage(body, `Swap simulation failed (${response.status})`),
       { httpStatus: response.status },
     );
   }
 
+  if (typeof body.would_execute !== "boolean" || !body.quote_id) {
+    emitApiEvent("simulate_swap", "protocol_error", startedAt, response.status);
+    throw new ManagedSwapRequestError("Malformed swap simulation response");
+  }
+  emitApiEvent("simulate_swap", "success", startedAt, response.status);
+
   return {
-    wouldExecute: body.would_execute === true,
-    quoteId: body.quote_id ?? quoteId,
+    wouldExecute: body.would_execute,
+    quoteId: body.quote_id,
     warnings: Array.isArray(body.warnings) ? body.warnings.map(String) : [],
     checks: Array.isArray(body.checks)
       ? body.checks.map((check) => ({
@@ -154,8 +207,9 @@ export async function executeManagedSwap(
   }
 
   let response: Response;
+  const startedAt = performance.now();
   try {
-    response = await fetch(`${API_BASE_URL}/v1/agent/swap/execute`, {
+    response = await fetchWithDeadline(`${API_BASE_URL}/v1/agent/swap/execute`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -165,22 +219,27 @@ export async function executeManagedSwap(
       body: JSON.stringify({ quote_id: quoteId }),
     });
   } catch (error) {
+    const timeout = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    emitApiEvent("execute_managed_swap", timeout ? "timeout" : "network_error", startedAt);
     throw new ManagedSwapRequestError(
-      error instanceof Error ? error.message : String(error),
+      `Managed swap ${timeout ? "timed out" : "transport failed"}`,
       { outcomeUnknown: true },
     );
   }
 
   const body = await readJson<ManagedSwapResponse>(response);
   if (!response.ok) {
+    emitApiEvent("execute_managed_swap", "http_error", startedAt, response.status);
     throw new ManagedSwapRequestError(
       errorMessage(body, `Swap execution failed (${response.status})`),
-      { httpStatus: response.status, outcomeUnknown: response.status >= 500 },
+      { httpStatus: response.status, outcomeUnknown: response.status === 408 || response.status >= 500 },
     );
   }
   if (body.swap_id === undefined || typeof body.status !== "string") {
+    emitApiEvent("execute_managed_swap", "protocol_error", startedAt, response.status);
     throw new ManagedSwapRequestError("Malformed managed swap response", { outcomeUnknown: true });
   }
+  emitApiEvent("execute_managed_swap", "success", startedAt, response.status);
 
   return {
     swapId: String(body.swap_id),
@@ -195,19 +254,32 @@ export async function getManagedSwapStatus(
   swapId: string,
 ): Promise<ManagedSwapStatus> {
   if (!apiKey) throw new Error("SUWAPPU_API_KEY is required for swap reconciliation");
-  const response = await fetch(`${API_BASE_URL}/v1/agent/swap/status/${encodeURIComponent(swapId)}`, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetchWithDeadline(`${API_BASE_URL}/v1/agent/swap/status/${encodeURIComponent(swapId)}`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+  } catch (error) {
+    const timeout = error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name);
+    emitApiEvent("get_swap_status", timeout ? "timeout" : "network_error", startedAt);
+    throw new ManagedSwapRequestError(
+      `Swap reconciliation ${timeout ? "timed out" : "transport failed"}`,
+    );
+  }
   const body = await readJson<ManagedSwapStatusResponse>(response);
   if (!response.ok) {
+    emitApiEvent("get_swap_status", "http_error", startedAt, response.status);
     throw new ManagedSwapRequestError(
       errorMessage(body, `Swap status failed (${response.status})`),
       { httpStatus: response.status },
     );
   }
   if (body.swap_id === undefined || typeof body.status !== "string") {
-    throw new Error("Malformed managed swap status response");
+    emitApiEvent("get_swap_status", "protocol_error", startedAt, response.status);
+    throw new ManagedSwapRequestError("Malformed managed swap status response");
   }
+  emitApiEvent("get_swap_status", "success", startedAt, response.status);
 
   return {
     swapId: String(body.swap_id),

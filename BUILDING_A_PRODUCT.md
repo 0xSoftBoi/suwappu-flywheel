@@ -88,13 +88,13 @@ POST /v1/agent/swap/execute       # Idempotency-Key header
 GET  /v1/agent/swap/status/:id
 ```
 
-`src/execution.ts` persists the idempotency key before submission. If execution times out or returns a server error, the same economic intent keeps the same key. If a `swap_id` is already known, the code polls status instead of submitting again.
+`src/execution.ts` persists the idempotency key before submission. If execution hits a timeout/network failure, HTTP 408/5xx, or malformed successful response, the same economic intent keeps the same key and is marked outcome-unknown. If a `swap_id` is already known, the code polls status instead of submitting again.
 
-In a production multi-worker service, move that journal to a transactional database and add locking/leases. The local JSON file is intentionally a readable reference, not a distributed-systems claim.
+Flywheel 2.x makes local authoritative state fail closed on corruption and writes it atomically, but the local store is still **single writer**. In a production multi-worker service, move that journal to a transactional database with a unique economic-intent constraint and locking/leases. Durable files are not a distributed-systems claim.
 
 ## Evaluate before automating
 
-Mature trading projects such as [Freqtrade](https://www.freqtrade.io/en/stable/strategy-101/) emphasize historical evaluation plus dry-run/forward testing, and [Hummingbot](https://github.com/hummingbot/hummingbot) provides much deeper trading/connector infrastructure. Flywheel does not replace those systems.
+Mature trading projects such as [Freqtrade](https://www.freqtrade.io/en/stable/strategy-customization/) run strategies through backtest, dry/forward-test, and live modes and provide a dedicated [lookahead-bias check](https://www.freqtrade.io/en/stable/lookahead-analysis/). [Hummingbot](https://hummingbot.org/docs/) provides deeper connector infrastructure, V2 controllers, backtesting, and multi-bot deployment. Flywheel does not replace those systems.
 
 Before letting a strategy move funds unattended, keep an append-only decision dataset with:
 
@@ -119,6 +119,8 @@ Then answer concrete questions:
 - Does a strategy still look useful after realistic costs and bad outcomes are included?
 
 Do not mix paper and live ledgers. Flywheel's scalper now stores them separately for exactly this reason.
+
+Do not call quote-time conversion loss a strategy return either. Flywheel's DCA learning waits for later market observations (15m, 1h, and 24h as those windows mature) and uses the most mature observed value for Kelly/attribution. For serious research, store the full time series and evaluate a declared horizon rather than selecting the best-looking one after the fact.
 
 ## Product metrics that matter
 
@@ -188,6 +190,8 @@ Before live automation:
 - expose a kill switch / disable path;
 - use approvals for actions beyond normal policy;
 - reconcile through status/webhooks before accounting;
+- make state corruption a stop condition, not a reason to silently reset a ledger;
+- reserve reconciliation capacity independently from normal scanning traffic;
 - log intent → approval → submission → outcome;
 - never store a user's private key just to make an example easier.
 
@@ -208,8 +212,10 @@ At each step, keep a simple decision: are people repeatedly getting enough value
 
 - `src/suwappu.ts` — current REST contract isolated from the older published SDK.
 - `src/execution.ts` — durable intent, simulation, idempotent submit, reconciliation.
+- `src/storage.ts` — fail-closed, atomic local financial-state persistence.
 - `tests/execution.test.ts` — regression tests for the money-moving boundary.
 - `src/strategies/dca.ts` — simple strategy integration with confirmed-only history.
 - `src/strategies/grid.ts` — downstream accounting that waits for finality.
+- `docs/OPERATIONS.md` — deployment, telemetry, backups, SLOs, release gates, and incident response.
 
 Then replace Flywheel's example signal logic with the product logic your users actually need.

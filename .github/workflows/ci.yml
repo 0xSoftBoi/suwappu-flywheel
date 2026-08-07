@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
@@ -28,3 +28,28 @@ jobs:
         run: bun run check
       - name: Test
         run: bun test
+      - name: Build entrypoints
+        run: bun run build
+      - name: CLI contract
+        run: bun run src/cli.ts --help
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Audit high/critical dependency advisories
+        run: bun audit --audit-level=high
+
+  container-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate Compose contract
+        run: cp .env.example .env && docker compose config --quiet
+      - name: Build non-root stateful image
+        run: docker build --tag suwappu-flywheel:ci .
