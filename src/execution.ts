@@ -5,9 +5,10 @@
  * before submission, simulates every fresh quote, and reconciles a known
  * swap_id before callers are allowed to account for an outcome.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { readJsonFile, writeJsonAtomic } from "./storage.js";
 import {
   executeManagedSwap,
   getManagedSwapStatus,
@@ -66,6 +67,13 @@ export interface QuoteForExecution {
   toAmount: string;
 }
 
+export class ExecutionLockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ExecutionLockError";
+  }
+}
+
 function stateDir(): string {
   return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? join(homedir(), ".suwappu-flywheel");
 }
@@ -74,23 +82,67 @@ function journalFile(): string {
   return join(stateDir(), "execution-journal.json");
 }
 
-function loadJournal(): ExecutionIntent[] {
+function executionLockFile(): string {
+  return join(stateDir(), "execution.lock");
+}
+
+function acquireExecutionLock(): () => void {
+  mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
+  const path = executionLockFile();
+  let fd: number;
   try {
-    if (existsSync(journalFile())) {
-      const parsed = JSON.parse(readFileSync(journalFile(), "utf-8"));
-      if (Array.isArray(parsed)) return parsed as ExecutionIntent[];
+    fd = openSync(path, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new ExecutionLockError(
+        `Live execution lock ${path} already exists; another writer may be active. Stop live writers and reconcile before treating it as stale`,
+      );
     }
-  } catch {}
-  return [];
+    throw error;
+  }
+
+  try {
+    writeFileSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }), "utf-8");
+    fsyncSync(fd);
+  } catch (error) {
+    closeSync(fd);
+    unlinkSync(path);
+    throw error;
+  }
+
+  return () => {
+    closeSync(fd);
+    unlinkSync(path);
+  };
+}
+
+function isExecutionJournal(value: unknown): boolean {
+  if (!Array.isArray(value)) return false;
+  return value.every((candidate) => {
+    if (!candidate || typeof candidate !== "object") return false;
+    const entry = candidate as Partial<ExecutionIntent>;
+    return (
+      typeof entry.id === "string"
+      && typeof entry.strategy === "string"
+      && typeof entry.actionKey === "string"
+      && typeof entry.phase === "string"
+      && !!entry.terms
+      && typeof entry.terms.fromToken === "string"
+      && typeof entry.terms.toToken === "string"
+      && typeof entry.terms.amount === "string"
+      && typeof entry.terms.chain === "string"
+      && typeof entry.createdAt === "string"
+      && typeof entry.updatedAt === "string"
+    );
+  });
+}
+
+function loadJournal(): ExecutionIntent[] {
+  return readJsonFile(journalFile(), () => [], isExecutionJournal);
 }
 
 function saveJournal(entries: ExecutionIntent[]): void {
-  const dir = stateDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  const target = journalFile();
-  const temporary = `${target}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(entries, null, 2));
-  renameSync(temporary, target);
+  writeJsonAtomic(journalFile(), entries);
 }
 
 function saveEntry(entry: ExecutionIntent): void {
@@ -203,7 +255,7 @@ async function reconcileKnownSwap(apiKey: string, entry: ExecutionIntent): Promi
  * request has a known swap_id, this function only reconciles it; it never
  * submits another economic action.
  */
-export async function runManagedExecution(args: {
+interface RunManagedExecutionArgs {
   apiKey: string;
   strategy: string;
   actionKey: string;
@@ -211,7 +263,18 @@ export async function runManagedExecution(args: {
   getQuote: () => Promise<QuoteForExecution>;
   walletAddress?: string;
   context?: Record<string, string | number | boolean | null>;
-}): Promise<ExecutionReceipt> {
+}
+
+export async function runManagedExecution(args: RunManagedExecutionArgs): Promise<ExecutionReceipt> {
+  const release = acquireExecutionLock();
+  try {
+    return await runManagedExecutionUnlocked(args);
+  } finally {
+    release();
+  }
+}
+
+async function runManagedExecutionUnlocked(args: RunManagedExecutionArgs): Promise<ExecutionReceipt> {
   let intent = currentIntent(args.strategy, args.actionKey);
 
   if (intent && !sameTerms(intent.terms, args.terms)) {

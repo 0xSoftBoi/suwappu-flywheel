@@ -12,9 +12,9 @@ import { getDCAHistory, isConfirmedDCAHistory, type HistoryEntry } from "./dca.j
 import type { FlywheelState } from "../brain/state.js";
 import { recordTrade } from "../brain/state.js";
 import { getCandles, calcATRPct, dynamicGridLevels } from "../indicators.js";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { readJsonFile, writeJsonAtomic } from "../storage.js";
 import {
   getUnaccountedExecution,
   markExecutionAccounted,
@@ -78,6 +78,12 @@ function defaultGrid(): GridState {
   };
 }
 
+function isGridState(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const grid = value as { levels?: unknown };
+  return Array.isArray(grid.levels);
+}
+
 function buildLevels(atrPct: number): GridLevel[] {
   const [l1, l2, l3] = dynamicGridLevels(atrPct);
   return [
@@ -88,32 +94,25 @@ function buildLevels(atrPct: number): GridLevel[] {
 }
 
 function loadGrid(): GridState {
-  try {
-    if (existsSync(gridFile())) {
-      const g = JSON.parse(readFileSync(gridFile(), "utf-8")) as GridState;
-      // Ensure new fields exist (backward compat)
-      if (g.lastATRPct === undefined) g.lastATRPct = 2.0;
-      for (const level of g.levels) {
-        if (level.trailingActive === undefined) level.trailingActive = false;
-        if (level.highWatermark === undefined) level.highWatermark = 0;
-        if (level.callbackPct === undefined) level.callbackPct = 0.015;
-      }
-      // Older Flywheel versions wrote sells at submission time. They cannot be
-      // trusted as fills, so only explicitly reconciled rows feed accounting.
-      g.sells = (g.sells ?? []).filter((sell) => (
-        sell.executionStatus === "completed" || sell.executionStatus === "confirmed"
-      ));
-      g.totalProfit = g.sells.reduce((sum, sell) => sum + (sell.profit ?? 0), 0);
-      return g;
-    }
-  } catch {}
-  return defaultGrid();
+  const g = readJsonFile(gridFile(), defaultGrid, isGridState);
+  // Ensure new fields exist (backward compat)
+  if (g.lastATRPct === undefined) g.lastATRPct = 2.0;
+  for (const level of g.levels) {
+    if (level.trailingActive === undefined) level.trailingActive = false;
+    if (level.highWatermark === undefined) level.highWatermark = 0;
+    if (level.callbackPct === undefined) level.callbackPct = 0.015;
+  }
+  // Older Flywheel versions wrote sells at submission time. They cannot be
+  // trusted as fills, so only explicitly reconciled rows feed accounting.
+  g.sells = (g.sells ?? []).filter((sell) => (
+    sell.executionStatus === "completed" || sell.executionStatus === "confirmed"
+  ));
+  g.totalProfit = g.sells.reduce((sum, sell) => sum + (sell.profit ?? 0), 0);
+  return g;
 }
 
 function saveGrid(state: GridState) {
-  const dir = stateDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(gridFile(), JSON.stringify(state, null, 2));
+  writeJsonAtomic(gridFile(), state);
 }
 
 function saveGridAndAcknowledgeExecutions(state: GridState) {

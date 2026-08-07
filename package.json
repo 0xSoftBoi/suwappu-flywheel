@@ -1,8 +1,10 @@
 {
   "name": "suwappu-flywheel",
-  "version": "1.0.0",
-  "description": "Suwappu strategy lab — read-only market screens, paper strategies, and outcome-safe managed execution",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Standalone Suwappu strategy-operations product with paper-first workflows and outcome-safe managed execution",
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "bin": { "suwappu-flywheel": "src/cli.ts", "flywheel-tui": "src/tui.ts" },
   "scripts": {
     "start": "bun run src/cli.ts run",
@@ -14,7 +16,9 @@
     "tui": "bun run src/tui.ts",
     "scalp": "bun run src/scalper.ts",
     "check": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "build": "bun build src/cli.ts src/tui.ts src/scalper.ts --target=bun --outdir=dist",
+    "verify": "bun run check && bun test && bun run build && bun audit --audit-level=high"
   },
   "dependencies": {
     "@suwappu/sdk": "^0.4.0",
@@ -24,6 +28,6 @@
     "@types/bun": "^1.3.14",
     "typescript": "^5.0.0"
   },
-  "engines": { "node": ">=18" },
+  "engines": { "bun": ">=1.3.14" },
   "license": "MIT"
 }

@@ -1,9 +1,9 @@
 import { describe, it, expect } from "bun:test";
 import { betaSample, chooseVault, updateVaultBelief, initVaultBeliefs } from "../src/brain/bandit";
-import { defaultState, recordTrade } from "../src/brain/state";
+import { defaultState, recordTrade, updatePortfolio } from "../src/brain/state";
 import type { FlywheelState } from "../src/brain/state";
-import { scoreTradeReward } from "../src/brain/reward";
-import { getRecommendedSize } from "../src/portfolio";
+import { backfillRewards, observedReturnPct, scoreTradeReward } from "../src/brain/reward";
+import { calculateKelly, calculateRiskMetrics, getRecommendedSize } from "../src/portfolio";
 
 // ── Thompson Sampling ──
 
@@ -91,6 +91,51 @@ describe("reward scoring", () => {
     });
     expect(scoreTradeReward(trade, 2100, state)).toBeCloseTo(0.02, 6);
   });
+
+  it("continues maturing a DCA outcome after an earlier reward was recorded", async () => {
+    const state = defaultState();
+    const trade = recordTrade(state, {
+      timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      strategy: "dca",
+      token: "ETH",
+      chain: "base",
+      amountIn: 100,
+      amountOut: 0.05,
+      priceAtEntry: 2000,
+      fearIndex: 50,
+      priceAfter15m: 2050,
+      reward: 0.01,
+      profitable: true,
+    });
+
+    const updated = await backfillRewards(state, async () => 2200);
+    expect(updated).toBe(1);
+    expect(trade.priceAfter1h).toBe(2200);
+    expect(observedReturnPct(trade)).toBeCloseTo(0.1, 6);
+    expect(state.portfolio.rollingReturns30d).toHaveLength(1);
+    expect(state.portfolio.rollingReturns30d[0]).toBeCloseTo(0.1, 6);
+  });
+
+  it("uses a later observed price for Kelly instead of entry-price slippage", () => {
+    const state = defaultState();
+    const trade = recordTrade(state, {
+      timestamp: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+      strategy: "dca",
+      token: "ETH",
+      chain: "base",
+      amountIn: 100,
+      amountOut: 0.05,
+      priceAtEntry: 2000,
+      fearIndex: 50,
+      priceAfter1h: 2200,
+      reward: 0.04,
+      profitable: true,
+    });
+
+    const kelly = calculateKelly([trade], "dca");
+    expect(kelly.winRate).toBe(1);
+    expect(kelly.avgWinPct).toBeCloseTo(0.1, 6);
+  });
 });
 
 // ── Adaptive Parameters ──
@@ -154,7 +199,7 @@ describe("adaptive parameters", () => {
 describe("state management", () => {
   it("defaultState has correct initial values", () => {
     const state = defaultState();
-    expect(state.version).toBe(1);
+    expect(state.version).toBe(2);
     expect(state.trades).toHaveLength(0);
     expect(state.adjustments.dcaAmountMultiplier).toBe(1.0);
     expect(state.adjustments.minArbSpread).toBe(0.5);
@@ -178,7 +223,7 @@ describe("state management", () => {
     expect(state.portfolio.totalInvested).toBe(10);
   });
 
-  it("rolling returns window stays at 30", () => {
+  it("does not fabricate DCA return observations at fill time", () => {
     const state = defaultState();
     for (let i = 0; i < 35; i++) {
       recordTrade(state, {
@@ -192,7 +237,26 @@ describe("state management", () => {
         fearIndex: 11,
       });
     }
-    expect(state.portfolio.rollingReturns30d.length).toBeLessThanOrEqual(30);
+    expect(state.portfolio.rollingReturns30d).toHaveLength(0);
+  });
+
+  it("keeps worst observed drawdown separate from current drawdown", () => {
+    const state = defaultState();
+    updatePortfolio(state, 100, 0, 0);
+    updatePortfolio(state, 80, 0, 0);
+    updatePortfolio(state, 120, 0, 0);
+    updatePortfolio(state, 114, 0, 0);
+
+    const risk = calculateRiskMetrics(state, 114);
+    expect(risk.maxObservedDrawdown).toBeCloseTo(0.2, 6);
+    expect(risk.currentDrawdown).toBeCloseTo(0.05, 6);
+  });
+
+  it("does not turn an entirely positive 95% lower-tail estimate into a fake loss", () => {
+    const state = defaultState();
+    state.portfolio.rollingReturns30d = [0.1, 0.1, 0.1];
+    const risk = calculateRiskMetrics(state, 100);
+    expect(risk.valueAtRisk95).toBe(0);
   });
 });
 

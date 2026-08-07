@@ -1,9 +1,9 @@
 import type { SuwappuClient } from "@suwappu/sdk";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { log, formatUsd, logJson } from "../utils.js";
 import { markExecutionAccounted, runManagedExecution } from "../execution.js";
+import { readJsonFile, writeJsonAtomic } from "../storage.js";
 
 function historyDir(): string {
   return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? join(homedir(), ".suwappu-flywheel");
@@ -30,16 +30,11 @@ export interface HistoryEntry {
 }
 
 function loadHistory(): HistoryEntry[] {
-  try {
-    if (existsSync(historyFile())) return JSON.parse(readFileSync(historyFile(), "utf-8"));
-  } catch {}
-  return [];
+  return readJsonFile(historyFile(), () => [], Array.isArray);
 }
 
 function saveHistory(entries: HistoryEntry[]) {
-  const dir = historyDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(historyFile(), JSON.stringify(entries, null, 2));
+  writeJsonAtomic(historyFile(), entries);
 }
 
 export function getDCAHistory(): HistoryEntry[] {
@@ -126,8 +121,9 @@ export async function executeDCA(
   const dryRun = opts.dryRun ?? true;
   const apiKey = process.env.SUWAPPU_API_KEY ?? "";
   const walletAddress = process.env.WALLET_ADDRESS ?? "";
+  const numericAmount = Number(amount);
 
-  if (!Number.isFinite(parseFloat(amount)) || parseFloat(amount) <= 0) {
+  if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
     const reason = `DCA amount must be greater than 0 (received ${amount})`;
     if (!opts.json) log("dca", `Skipped: ${reason}`);
     return {
@@ -137,8 +133,17 @@ export async function executeDCA(
     };
   }
 
-  const maxTradeUsd = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD ?? "1000");
-  if (!dryRun && Number.isFinite(maxTradeUsd) && parseFloat(amount) > maxTradeUsd) {
+  const maxTradeUsd = Number(process.env.SUWAPPU_MAX_TRADE_USD ?? "1000");
+  if (!dryRun && (!Number.isFinite(maxTradeUsd) || maxTradeUsd <= 0)) {
+    const reason = "SUWAPPU_MAX_TRADE_USD must be a positive number for live DCA";
+    if (!opts.json) log("dca", `Skipped: ${reason}`);
+    return {
+      token, price: 0, amount, chain,
+      executed: false, dryRun: false,
+      skipped: true, skipReason: reason,
+    };
+  }
+  if (!dryRun && numericAmount > maxTradeUsd) {
     const reason = `DCA amount ${amount} exceeds live cap ${maxTradeUsd}; change SUWAPPU_MAX_TRADE_USD deliberately to raise it`;
     if (!opts.json) log("dca", `Skipped: ${reason}`);
     return {
@@ -151,7 +156,7 @@ export async function executeDCA(
   // Check USDC balance before trading
   if (!dryRun && walletAddress) {
     const usdcBal = await getUSDCBalance(walletAddress);
-    if (usdcBal >= 0 && usdcBal < parseFloat(amount)) {
+    if (usdcBal >= 0 && usdcBal < numericAmount) {
       const reason = usdcBal < 10
         ? `USDC balance too low ($${usdcBal.toFixed(2)}) — DCA paused`
         : `Insufficient USDC ($${usdcBal.toFixed(2)}) for $${amount} trade`;
@@ -180,7 +185,7 @@ export async function executeDCA(
   };
 
   if (dryRun) {
-    const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
+    const quote = await client.getQuote("USDC", token, numericAmount, chain);
     result.quoteId = quote.id;
     result.toAmount = quote.toAmount;
     if (opts.json) {
@@ -196,7 +201,7 @@ export async function executeDCA(
       actionKey: "buy",
       terms: { fromToken: "USDC", toToken: token, amount, chain },
       getQuote: async () => {
-        const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
+        const quote = await client.getQuote("USDC", token, numericAmount, chain);
         return { id: quote.id, toAmount: quote.toAmount };
       },
       walletAddress: process.env.SUWAPPU_MANAGED_WALLET_ADDRESS,

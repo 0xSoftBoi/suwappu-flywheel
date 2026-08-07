@@ -2,6 +2,13 @@ services:
   flywheel:
     build: .
     env_file: .env
+    environment:
+      SUWAPPU_FLYWHEEL_STATE_DIR: /data
+    volumes:
+      - flywheel_state:/data
     # `run` is one strategy cycle. Do not turn a one-shot command into an
     # accidental tight loop (especially if a user later opts into --execute).
     restart: "no"
+
+volumes:
+  flywheel_state:

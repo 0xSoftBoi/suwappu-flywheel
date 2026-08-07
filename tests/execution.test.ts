@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "fs";
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { runManagedExecution } from "../src/execution";
+import { ExecutionLockError, listExecutionJournal, runManagedExecution } from "../src/execution";
+import { StateFileError } from "../src/storage";
+import { operationTimeoutMs, simulateManagedSwap } from "../src/suwappu";
 
 const originalFetch = globalThis.fetch;
 let testStateDir = "";
@@ -22,6 +24,8 @@ beforeEach(() => {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   delete process.env.SUWAPPU_FLYWHEEL_STATE_DIR;
+  delete process.env.SUWAPPU_OPERATION_TIMEOUT_MS;
+  delete process.env.SUWAPPU_API_EVENTS;
   rmSync(testStateDir, { recursive: true, force: true });
 });
 
@@ -151,5 +155,74 @@ describe("durable managed execution", () => {
     expect(completed.intent.phase).toBe("completed");
     expect(completed.intent.actualToAmount).toBe("0.0021");
     expect(completed.intent.quotedToAmount).toBe("0.0022");
+  });
+
+  it("treats an HTTP 408 during managed submission as outcome-unknown", async () => {
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/swap/simulate")) {
+        return jsonResponse({ quote_id: "q-timeout", would_execute: true, warnings: [], checks: [] });
+      }
+      if (url.endsWith("/swap/execute")) {
+        return jsonResponse({ error: "request timeout" }, 408);
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    }) as typeof fetch;
+
+    const result = await runManagedExecution({
+      apiKey: "test-key",
+      strategy: "dca",
+      actionKey: "buy",
+      terms: { fromToken: "USDC", toToken: "ETH", amount: "5", chain: "base" },
+      getQuote: async () => ({ id: "q-timeout", toAmount: "0.002" }),
+    });
+
+    expect(result.intent.phase).toBe("outcome_unknown");
+  });
+
+  it("fails closed instead of replacing a corrupt execution journal", () => {
+    writeFileSync(join(testStateDir, "execution-journal.json"), "{not-json", "utf-8");
+    expect(() => listExecutionJournal()).toThrow(StateFileError);
+  });
+
+  it("refuses a second live writer when the execution lock already exists", async () => {
+    writeFileSync(join(testStateDir, "execution.lock"), "owned-by-another-writer", "utf-8");
+    await expect(runManagedExecution({
+      apiKey: "test-key",
+      strategy: "dca",
+      actionKey: "buy",
+      terms: { fromToken: "USDC", toToken: "ETH", amount: "5", chain: "base" },
+      getQuote: async () => ({ id: "q-never", toAmount: "0.002" }),
+    })).rejects.toBeInstanceOf(ExecutionLockError);
+  });
+
+  it("fails invalid managed-operation deadline configuration closed", () => {
+    process.env.SUWAPPU_OPERATION_TIMEOUT_MS = "not-a-number";
+    expect(() => operationTimeoutMs()).toThrow(/between 100 and 30000/);
+  });
+
+  it("keeps optional managed API events free of financial identifiers and secrets", async () => {
+    process.env.SUWAPPU_API_EVENTS = "1";
+    const messages: string[] = [];
+    const originalConsoleError = console.error;
+    console.error = (...args: unknown[]) => messages.push(args.map(String).join(" "));
+    globalThis.fetch = (async () => jsonResponse({
+      quote_id: "secret-quote-id",
+      would_execute: true,
+      warnings: [],
+      checks: [],
+    })) as unknown as typeof fetch;
+
+    try {
+      await simulateManagedSwap("secret-api-key", "secret-quote-id", "0xsecret-wallet");
+    } finally {
+      console.error = originalConsoleError;
+    }
+
+    const output = messages.join("\n");
+    expect(output).toContain('"operation":"simulate_swap"');
+    expect(output).not.toContain("secret-api-key");
+    expect(output).not.toContain("secret-quote-id");
+    expect(output).not.toContain("0xsecret-wallet");
   });
 });

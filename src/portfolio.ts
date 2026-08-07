@@ -3,6 +3,7 @@
  * Pure computation functions. No side effects, no API calls, no file I/O.
  */
 import type { FlywheelState, TradeRecord } from "./brain/state.js";
+import { observedReturnPct } from "./brain/reward.js";
 import { fearMultiplier } from "./strategies/dca.js";
 import { rsiMultiplier } from "./indicators.js";
 
@@ -37,8 +38,8 @@ export interface RiskMetrics {
   sortinoRatio: number;
   calmarRatio: number;
   valueAtRisk95: number;
-  maxDrawdown: number;
-  maxDrawdownDuration: number;
+  maxObservedDrawdown: number;
+  currentDrawdownDurationDays: number;
   currentDrawdown: number;
 }
 
@@ -60,7 +61,7 @@ export interface StrategyAttribution {
   tradeCount: number;
   scoredCount: number;
   winRate: number;
-  totalPnL: number;
+  cumulativeReturn: number;
   avgReturn: number;
   bestTrade: number;
   worstTrade: number;
@@ -111,27 +112,17 @@ function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
 }
 
-/** Raw P&L for a trade (not the composite reward score) */
-function rawPnL(trade: TradeRecord): number {
-  if (trade.strategy === "grid_sell") {
-    // Sells: amountOut is USDC received, amountIn is ETH sold
-    return trade.priceAtEntry > 0
-      ? (trade.amountOut - trade.amountIn * trade.priceAtEntry) / (trade.amountIn * trade.priceAtEntry)
-      : 0;
-  }
-  // Buys: amountIn is USDC spent, amountOut is ETH received
-  return trade.priceAtEntry > 0
-    ? (trade.amountOut * trade.priceAtEntry - trade.amountIn) / trade.amountIn
-    : 0;
-}
-
 // ── Kelly Criterion ──
 
 export function calculateKelly(
   trades: TradeRecord[],
   strategy?: "dca" | "arb" | "grid_sell"
 ): KellyResult {
-  let scored = trades.filter((t) => t.reward !== undefined && t.priceAtEntry > 0);
+  let scored = trades.filter((t) => (
+    t.reward !== undefined
+    && t.priceAtEntry > 0
+    && observedReturnPct(t) !== undefined
+  ));
   if (strategy) scored = scored.filter((t) => t.strategy === strategy);
 
   const result: KellyResult = {
@@ -146,7 +137,7 @@ export function calculateKelly(
 
   if (scored.length === 0) return result;
 
-  const pnls = scored.map(rawPnL);
+  const pnls = scored.map((trade) => observedReturnPct(trade) as number);
   const winners = pnls.filter((p) => p > 0);
   const losers = pnls.filter((p) => p <= 0);
 
@@ -203,8 +194,7 @@ export function calculateRiskMetrics(
   // Sharpe
   let sharpe = 0;
   if (returns.length >= 2 && stdDev(returns) > 0) {
-    const annualizedMean = meanRet * (annualizationFactor ** 2 / DAYS_PER_YEAR) * DAYS_PER_YEAR;
-    // Simpler: (meanReturn * tradesPerYear - Rf) / annualizedVol
+    // Trade-observation estimate: (meanReturn * tradesPerYear - Rf) / annualizedVol.
     const tradesPerYear = trades.length >= 2
       ? trades.length / Math.max(1, (Date.now() - new Date(trades[0].timestamp).getTime()) / (1000 * 86400)) * DAYS_PER_YEAR
       : DAYS_PER_YEAR;
@@ -225,20 +215,17 @@ export function calculateRiskMetrics(
     }
   }
 
-  // Max drawdown
+  // Current drawdown and the worst drawdown actually observed by updatePortfolio().
   const peak = state.portfolio.peakValue;
-  const maxDD = peak > 0 ? Math.max(0, (peak - currentValue) / peak) : 0;
-  const currentDD = maxDD;
+  const currentDD = peak > 0 ? Math.max(0, (peak - currentValue) / peak) : 0;
+  const maxDD = Math.max(state.portfolio.maxDrawdownObserved ?? 0, currentDD);
 
-  // Drawdown duration (days since peak)
+  // Current drawdown duration (days since the observed portfolio peak).
   let ddDuration = 0;
-  if (peak > 0 && currentValue < peak && trades.length > 0) {
-    // Find when peak was reached (approximate from trades)
-    const peakTrade = [...trades].reverse().find((t) =>
-      t.priceAtEntry > 0 && new Date(t.timestamp).getTime() < Date.now()
-    );
-    if (peakTrade) {
-      ddDuration = (Date.now() - new Date(trades[0].timestamp).getTime()) / (1000 * 86400);
+  if (currentDD > 0 && state.portfolio.peakValueAt) {
+    const peakAt = new Date(state.portfolio.peakValueAt).getTime();
+    if (Number.isFinite(peakAt)) {
+      ddDuration = Math.max(0, (Date.now() - peakAt) / (1000 * 86400));
     }
   }
 
@@ -256,10 +243,11 @@ export function calculateRiskMetrics(
     if (!isFinite(calmar)) calmar = 0;
   }
 
-  // VaR (95%) — worst expected loss per trade at 95% confidence
+  // Parametric one-observation VaR estimate at 95% confidence. A positive
+  // expected lower-tail return is a zero loss estimate, never an absolute loss.
   const sd = stdDev(returns);
   const var95 = returns.length >= 2
-    ? Math.abs(currentValue * (meanRet - 1.645 * sd))
+    ? Math.max(0, -currentValue * (meanRet - 1.645 * sd))
     : 0;
 
   return {
@@ -268,8 +256,8 @@ export function calculateRiskMetrics(
     sortinoRatio: sortino,
     calmarRatio: calmar,
     valueAtRisk95: var95,
-    maxDrawdown: maxDD,
-    maxDrawdownDuration: ddDuration,
+    maxObservedDrawdown: maxDD,
+    currentDrawdownDurationDays: ddDuration,
     currentDrawdown: currentDD,
   };
 }
@@ -338,8 +326,8 @@ export function attributeStrategies(trades: TradeRecord[]): StrategyAttribution[
 
   const result: StrategyAttribution[] = [];
   for (const [strategy, group] of groups) {
-    const scored = group.filter((t) => t.reward !== undefined);
-    const pnls = scored.map(rawPnL);
+    const scored = group.filter((t) => t.reward !== undefined && observedReturnPct(t) !== undefined);
+    const pnls = scored.map((trade) => observedReturnPct(trade) as number);
     const winners = scored.filter((t) => t.profitable === true);
 
     result.push({
@@ -347,14 +335,14 @@ export function attributeStrategies(trades: TradeRecord[]): StrategyAttribution[
       tradeCount: group.length,
       scoredCount: scored.length,
       winRate: scored.length > 0 ? winners.length / scored.length : 0,
-      totalPnL: pnls.reduce((s, v) => s + v, 0),
+      cumulativeReturn: pnls.reduce((s, v) => s + v, 0),
       avgReturn: pnls.length > 0 ? mean(pnls) : 0,
       bestTrade: pnls.length > 0 ? Math.max(...pnls) : 0,
       worstTrade: pnls.length > 0 ? Math.min(...pnls) : 0,
     });
   }
 
-  return result.sort((a, b) => b.totalPnL - a.totalPnL);
+  return result.sort((a, b) => b.cumulativeReturn - a.cumulativeReturn);
 }
 
 // ── Risk-Adjusted Sizing ──
@@ -478,9 +466,9 @@ export function formatPortfolioReport(
   lines.push(`  Sharpe Ratio        ${r.sharpeRatio.toFixed(2)}`);
   lines.push(`  Sortino Ratio       ${r.sortinoRatio.toFixed(2)}`);
   lines.push(`  Calmar Ratio        ${r.calmarRatio.toFixed(2)}`);
-  lines.push(`  VaR (95%, per trade) $${r.valueAtRisk95.toFixed(2)}`);
-  lines.push(`  Max Drawdown        ${(r.maxDrawdown * 100).toFixed(1)}%`);
-  lines.push(`  DD Duration         ${r.maxDrawdownDuration.toFixed(1)} days`);
+  lines.push(`  VaR (95%, obs.)     $${r.valueAtRisk95.toFixed(2)}`);
+  lines.push(`  Max observed DD     ${(r.maxObservedDrawdown * 100).toFixed(1)}%`);
+  lines.push(`  Current DD age      ${r.currentDrawdownDurationDays.toFixed(1)} days`);
   lines.push(`  Current Drawdown    ${(r.currentDrawdown * 100).toFixed(1)}%`);
   lines.push("");
 

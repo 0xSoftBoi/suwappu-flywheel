@@ -20,6 +20,7 @@ import { loadState } from "./brain/state.js";
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { readJsonFile, writeJsonAtomic } from "./storage.js";
 
 // ── Constants ──
 function stateDir(): string {
@@ -157,31 +158,31 @@ function defaultScalperState(): ScalperState {
   };
 }
 
+function isScalperState(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const state = value as { position?: unknown; closedTrades?: unknown };
+  return "position" in state && Array.isArray(state.closedTrades);
+}
+
 function loadScalperState(dryRun: boolean): ScalperState {
-  try {
-    if (existsSync(scalperStateFile(dryRun))) {
-      const s = JSON.parse(readFileSync(scalperStateFile(dryRun), "utf-8")) as ScalperState;
-      // Reset hourly counter
-      const now = new Date();
-      if (new Date(s.hourStart).getHours() !== now.getHours()) {
-        s.tradesThisHour = 0;
-        s.hourStart = now.toISOString();
-      }
-      // Reset daily counter
-      const today = now.toISOString().slice(0, 10);
-      if (s.dayStart !== today) {
-        s.dailyPnL = 0;
-        s.dayStart = today;
-      }
-      return s;
-    }
-  } catch {}
-  return defaultScalperState();
+  const s = readJsonFile(scalperStateFile(dryRun), defaultScalperState, isScalperState);
+  // Reset hourly counter
+  const now = new Date();
+  if (new Date(s.hourStart).getHours() !== now.getHours()) {
+    s.tradesThisHour = 0;
+    s.hourStart = now.toISOString();
+  }
+  // Reset daily counter
+  const today = now.toISOString().slice(0, 10);
+  if (s.dayStart !== today) {
+    s.dailyPnL = 0;
+    s.dayStart = today;
+  }
+  return s;
 }
 
 function saveScalperState(s: ScalperState, dryRun: boolean) {
-  if (!existsSync(stateDir())) mkdirSync(stateDir(), { recursive: true });
-  writeFileSync(scalperStateFile(dryRun), JSON.stringify(s, null, 2));
+  writeJsonAtomic(scalperStateFile(dryRun), s);
 }
 
 // ── Binance data ──
@@ -542,6 +543,18 @@ export async function runScalper(opts: {
   if (!opts.dryRun && !opts.execute) {
     throw new Error("Live scalper mode requires execute=true; use dryRun=true for paper mode");
   }
+  if (!Number.isFinite(opts.amount) || opts.amount <= 0) {
+    throw new Error("Scalper amount must be a positive number");
+  }
+  const maxLiveTradeUsd = Number(process.env.SUWAPPU_MAX_TRADE_USD ?? "1000");
+  if (!opts.dryRun && (!Number.isFinite(maxLiveTradeUsd) || maxLiveTradeUsd <= 0)) {
+    throw new Error("SUWAPPU_MAX_TRADE_USD must be a positive number for live scalping");
+  }
+  if (!opts.dryRun && opts.amount > maxLiveTradeUsd) {
+    throw new Error(
+      `Scalper amount ${opts.amount} exceeds live cap ${maxLiveTradeUsd}; change SUWAPPU_MAX_TRADE_USD deliberately to raise it`,
+    );
+  }
   const apiKey = requireEnv("SUWAPPU_API_KEY");
   const state = loadScalperState(opts.dryRun);
   let tickNum = 0;
@@ -562,6 +575,12 @@ export async function runScalper(opts: {
   const brainState = loadState();
   const kelly = calculateKelly(brainState.trades);
   const maxFraction = kelly.sufficient && kelly.halfKelly > 0 ? kelly.halfKelly : 0.05;
+  const configuredBudget = process.env.SUWAPPU_SCALPER_USDC_BUDGET === undefined
+    ? undefined
+    : Number(process.env.SUWAPPU_SCALPER_USDC_BUDGET);
+  if (configuredBudget !== undefined && (!Number.isFinite(configuredBudget) || configuredBudget <= 0)) {
+    throw new Error("SUWAPPU_SCALPER_USDC_BUDGET must be a positive number when set");
+  }
 
   while (true) {
     tickNum++;
@@ -632,7 +651,13 @@ export async function runScalper(opts: {
 
       // Execute
       if (action === "buy" && !state.position) {
-        const tradeAmount = Math.min(opts.amount, Math.max(1, Math.floor(32 * maxFraction))); // 32 = approximate USDC balance
+        // `--amount` is the hard per-trade request. Apply percentage sizing only
+        // when the operator supplied a real strategy budget; never invent an
+        // approximate wallet balance to make Kelly math look more precise.
+        const budgetCap = configuredBudget === undefined
+          ? opts.amount
+          : configuredBudget * maxFraction;
+        const tradeAmount = Math.min(opts.amount, budgetCap);
         try {
           if (opts.dryRun) {
             const result = await paperBuy(apiKey, tradeAmount);
