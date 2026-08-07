@@ -2,6 +2,7 @@ import { describe, it, expect } from "bun:test";
 import { fearMultiplier } from "../src/strategies/dca";
 import { calculateSpreadPct, estimateArbNetUsd } from "../src/strategies/arb";
 import { predictionPriceSumDeviation } from "../src/strategies/predict";
+import { isGridInventoryHistory } from "../src/strategies/grid";
 
 // ── Fear multiplier logic ──
 describe("fear-adjusted DCA multiplier", () => {
@@ -26,6 +27,25 @@ describe("fear-adjusted DCA multiplier", () => {
     expect(Math.round(base * fearMultiplier(10))).toBe(20); // 4x during extreme fear
     expect(Math.round(base * fearMultiplier(50))).toBe(5);  // 1x neutral
     expect(Math.round(base * fearMultiplier(90))).toBe(1);  // 0.25x greed
+  });
+});
+
+describe("grid inventory accounting", () => {
+  const confirmedEthBase = {
+    timestamp: "2026-08-07T00:00:00.000Z",
+    token: "ETH",
+    amount: "10",
+    price: 2500,
+    toAmount: "0.004",
+    chain: "base",
+    executionStatus: "completed" as const,
+  };
+
+  it("accepts only reconciled ETH buys on Base", () => {
+    expect(isGridInventoryHistory(confirmedEthBase)).toBe(true);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, token: "SOL" })).toBe(false);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, chain: "arbitrum" })).toBe(false);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, executionStatus: undefined })).toBe(false);
   });
 });
 
