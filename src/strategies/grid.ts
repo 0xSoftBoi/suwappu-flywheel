@@ -8,7 +8,7 @@
  */
 
 import { log, formatUsd, logJson } from "../utils.js";
-import { getDCAHistory, isConfirmedDCAHistory } from "./dca.js";
+import { getDCAHistory, isConfirmedDCAHistory, type HistoryEntry } from "./dca.js";
 import type { FlywheelState } from "../brain/state.js";
 import { recordTrade } from "../brain/state.js";
 import { getCandles, calcATRPct, dynamicGridLevels } from "../indicators.js";
@@ -128,8 +128,14 @@ function saveGridAndAcknowledgeExecutions(state: GridState) {
 }
 
 /** Sync grid state with DCA history */
+export function isGridInventoryHistory(entry: HistoryEntry): boolean {
+  return isConfirmedDCAHistory(entry)
+    && entry.token.toUpperCase() === "ETH"
+    && entry.chain.toLowerCase() === "base";
+}
+
 function syncWithDCA(grid: GridState): GridState {
-  const history = getDCAHistory().filter(isConfirmedDCAHistory);
+  const history = getDCAHistory().filter(isGridInventoryHistory);
   if (history.length === 0) {
     grid.totalUsdcSpent = 0;
     grid.totalEthHeld = 0;
