@@ -317,6 +317,8 @@ export async function checkGrid(opts: {
         } else if (receipt.intent.phase === "failed") {
           markExecutionAccounted(receipt.intent.id);
           if (!opts.json) log("grid", `  Prior level ${i + 1} was not executed: ${receipt.intent.error ?? "failed"}`);
+        } else if (receipt.intent.phase === "completed") {
+          if (!opts.json) log("grid", `  Level ${i + 1} completed, but final amounts are unavailable; accounting remains on hold`);
         } else if (!opts.json) {
           log("grid", `  Level ${i + 1} intent ${receipt.intent.id} is ${receipt.intent.phase}; waiting for final status`);
         }
@@ -431,6 +433,8 @@ export async function checkGrid(opts: {
         } else if (intent.phase === "failed") {
           markExecutionAccounted(intent.id);
           if (!opts.json) log("grid", `  NOT EXECUTED: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+        } else if (intent.phase === "completed") {
+          if (!opts.json) log("grid", "  COMPLETED, but final amounts are unavailable; holdings/P&L remain unchanged until reconciliation returns them.");
         } else if (!opts.json) {
           log("grid", `  SUBMITTED: intent ${intent.id}${intent.swapId ? ` | Swap ${intent.swapId}` : ""} (${intent.swapStatus ?? intent.phase})`);
           log("grid", "  Holdings and realized P&L are unchanged until reconciliation confirms the swap.");
