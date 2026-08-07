@@ -1,18 +1,42 @@
 #!/bin/bash
+set -euo pipefail
+
 # SECURITY: Never commit .env to git. Copy from .env.example and fill in values.
-# Verify: grep -r "SUWAPPU_API_KEY=suwappu_sk_" . --include="*.sh" --include="*.env"
-export PATH="$HOME/.bun/bin:$HOME/.nvm/versions/node/$(ls $HOME/.nvm/versions/node/ 2>/dev/null | tail -1)/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+# This helper is paper/read-only by default. Pass --execute explicitly for live mode.
+export PATH="$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-FLYWHEEL_DIR="$HOME/Desktop/suwappu-flywheel"
-cd "$FLYWHEEL_DIR" || exit 1
+FLYWHEEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$FLYWHEEL_DIR"
 
-# Load env vars
-if [ ! -f "$FLYWHEEL_DIR/.env" ]; then echo "ERROR: .env not found. Copy .env.example first."; exit 1; fi
-set -a; source "$FLYWHEEL_DIR/.env"; set +a
+if [ ! -f "$FLYWHEEL_DIR/.env" ]; then
+  echo "ERROR: .env not found. Copy .env.example first."
+  exit 1
+fi
 
-# Run full flywheel: DCA buy + Grid sell + Brain learn
-echo "$(date): starting flywheel run" >> ~/.suwappu-flywheel/cron.log
-bun run src/cli.ts run --execute --amount 2 --json 2>&1 | tee -a ~/.suwappu-flywheel/flywheel.log
+set -a
+source "$FLYWHEEL_DIR/.env"
+set +a
 
-# Log result
-echo "$(date): flywheel run completed (exit $?)" >> ~/.suwappu-flywheel/cron.log
+STATE_DIR="${SUWAPPU_FLYWHEEL_STATE_DIR:-$HOME/.suwappu-flywheel}"
+mkdir -p "$STATE_DIR"
+
+EXEC_ARGS=()
+MODE="paper"
+if [ "${1:-}" = "--execute" ]; then
+  EXEC_ARGS=(--execute)
+  MODE="live"
+elif [ "$#" -gt 0 ]; then
+  echo "Usage: $0 [--execute]"
+  exit 2
+fi
+
+echo "$(date): starting flywheel run ($MODE)" >> "$STATE_DIR/cron.log"
+
+# Preserve Bun's exit status even though output is also written to the log.
+set +e
+bun run src/cli.ts run "${EXEC_ARGS[@]}" --amount 2 --json 2>&1 | tee -a "$STATE_DIR/flywheel.log"
+run_status=${PIPESTATUS[0]}
+set -e
+
+echo "$(date): flywheel run completed (exit $run_status)" >> "$STATE_DIR/cron.log"
+exit "$run_status"

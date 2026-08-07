@@ -3,12 +3,17 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { log, formatUsd, logJson } from "../utils.js";
-import { executeManagedSwap } from "../suwappu.js";
+import { markExecutionAccounted, runManagedExecution } from "../execution.js";
 
-const HISTORY_DIR = join(homedir(), ".suwappu-flywheel");
-const HISTORY_FILE = join(HISTORY_DIR, "dca-history.json");
+function historyDir(): string {
+  return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? join(homedir(), ".suwappu-flywheel");
+}
 
-interface HistoryEntry {
+function historyFile(): string {
+  return join(historyDir(), "dca-history.json");
+}
+
+export interface HistoryEntry {
   timestamp: string;
   token: string;
   amount: string;
@@ -17,22 +22,33 @@ interface HistoryEntry {
   chain: string;
   fearIndex?: number;
   multiplier?: number;
+  executionStatus?: "completed" | "confirmed";
+  intentId?: string;
+  quoteId?: string;
+  swapId?: string;
+  txHash?: string;
 }
 
 function loadHistory(): HistoryEntry[] {
   try {
-    if (existsSync(HISTORY_FILE)) return JSON.parse(readFileSync(HISTORY_FILE, "utf-8"));
+    if (existsSync(historyFile())) return JSON.parse(readFileSync(historyFile(), "utf-8"));
   } catch {}
   return [];
 }
 
 function saveHistory(entries: HistoryEntry[]) {
-  if (!existsSync(HISTORY_DIR)) mkdirSync(HISTORY_DIR, { recursive: true });
-  writeFileSync(HISTORY_FILE, JSON.stringify(entries, null, 2));
+  const dir = historyDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(historyFile(), JSON.stringify(entries, null, 2));
 }
 
 export function getDCAHistory(): HistoryEntry[] {
   return loadHistory();
+}
+
+/** Legacy history was written at submission time, so only new verified rows are accounting-safe. */
+export function isConfirmedDCAHistory(entry: HistoryEntry): boolean {
+  return entry.executionStatus === "completed" || entry.executionStatus === "confirmed";
 }
 
 /** Check USDC balance on-chain via Base RPC */
@@ -84,12 +100,14 @@ interface DCAResult {
   quoteId?: string;
   toAmount?: string;
   executed: boolean;
+  submitted?: boolean;
   dryRun: boolean;
   skipped?: boolean;
   skipReason?: string;
   swapId?: string;
   swapStatus?: string;
   txHash?: string;
+  intentId?: string;
 }
 
 export async function executeDCA(
@@ -108,6 +126,27 @@ export async function executeDCA(
   const dryRun = opts.dryRun ?? true;
   const apiKey = process.env.SUWAPPU_API_KEY ?? "";
   const walletAddress = process.env.WALLET_ADDRESS ?? "";
+
+  if (!Number.isFinite(parseFloat(amount)) || parseFloat(amount) <= 0) {
+    const reason = `DCA amount must be greater than 0 (received ${amount})`;
+    if (!opts.json) log("dca", `Skipped: ${reason}`);
+    return {
+      token, price: 0, amount, chain,
+      executed: false, dryRun,
+      skipped: true, skipReason: reason,
+    };
+  }
+
+  const maxTradeUsd = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD ?? "1000");
+  if (!dryRun && Number.isFinite(maxTradeUsd) && parseFloat(amount) > maxTradeUsd) {
+    const reason = `DCA amount ${amount} exceeds live cap ${maxTradeUsd}; change SUWAPPU_MAX_TRADE_USD deliberately to raise it`;
+    if (!opts.json) log("dca", `Skipped: ${reason}`);
+    return {
+      token, price: 0, amount, chain,
+      executed: false, dryRun,
+      skipped: true, skipReason: reason,
+    };
+  }
 
   // Check USDC balance before trading
   if (!dryRun && walletAddress) {
@@ -134,18 +173,16 @@ export async function executeDCA(
 
   if (!opts.json) log("dca", `${token}: ${formatUsd(price)}`);
 
-  // Get quote
-  const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
-
   const result: DCAResult = {
     token, price, amount, chain,
-    quoteId: quote.id,
-    toAmount: quote.toAmount,
     executed: false,
     dryRun,
   };
 
   if (dryRun) {
+    const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
+    result.quoteId = quote.id;
+    result.toAmount = quote.toAmount;
     if (opts.json) {
       logJson({ strategy: "dca", action: "dry_run", ...result });
     } else {
@@ -153,46 +190,82 @@ export async function executeDCA(
       log("dca", `  Rate: 1 ${token} = ${formatUsd(price)} | Via: ${quote.dex || "auto"}`);
     }
   } else {
-    // Submit through Suwappu's managed-wallet execution pipeline.
-    try {
-      const swap = await executeManagedSwap(apiKey, quote.id);
+    const receipt = await runManagedExecution({
+      apiKey,
+      strategy: "dca",
+      actionKey: "buy",
+      terms: { fromToken: "USDC", toToken: token, amount, chain },
+      getQuote: async () => {
+        const quote = await client.getQuote("USDC", token, parseFloat(amount), chain);
+        return { id: quote.id, toAmount: quote.toAmount };
+      },
+      walletAddress: process.env.SUWAPPU_MANAGED_WALLET_ADDRESS,
+      context: { price, decisionAt: new Date().toISOString() },
+    });
+    const intent = receipt.intent;
+    const recordedPrice = typeof intent.context?.price === "number" ? intent.context.price : price;
+
+    result.price = recordedPrice;
+    result.intentId = intent.id;
+    result.quoteId = intent.quoteId;
+    result.toAmount = intent.actualToAmount ?? intent.quotedToAmount;
+    result.swapId = intent.swapId;
+    result.swapStatus = intent.swapStatus ?? intent.phase;
+    result.txHash = intent.txHash;
+    result.submitted = ["submitting", "submitted", "outcome_unknown"].includes(intent.phase);
+
+    // Accounting and learning only consume a reconciled terminal success with a
+    // final amount from the status record. A quote amount is never a fill.
+    if (intent.phase === "completed" && intent.actualToAmount) {
       result.executed = true;
-      result.swapId = swap.swapId;
-      result.swapStatus = swap.status;
-      result.txHash = swap.txHash;
-
-      // Save accepted submissions to DCA history. swapId is surfaced separately
-      // so callers can poll finality even when a tx hash is not available yet.
+      result.toAmount = intent.actualToAmount;
       const history = loadHistory();
-      history.push({
-        timestamp: new Date().toISOString(),
-        token, amount, price,
-        toAmount: quote.toAmount,
-        chain,
-      });
-      saveHistory(history);
-
-      if (opts.json) {
-        logJson({
-          strategy: "dca",
-          action: "submitted",
-          swapId: swap.swapId,
-          status: swap.status,
-          txHash: swap.txHash,
-          pollUrl: swap.pollUrl,
-          ...result,
+      if (!history.some((entry) => entry.intentId === intent.id)) {
+        history.push({
+          timestamp: typeof intent.context?.decisionAt === "string" ? intent.context.decisionAt : intent.createdAt,
+          token,
+          amount: intent.actualFromAmount ?? amount,
+          price: recordedPrice,
+          toAmount: intent.actualToAmount,
+          chain,
+          executionStatus: "completed",
+          intentId: intent.id,
+          quoteId: intent.quoteId,
+          swapId: intent.swapId,
+          txHash: intent.txHash,
         });
-      } else {
-        log("dca", `SUBMITTED: ${amount} USDC → ${quote.toAmount} ${token} | Swap ${swap.swapId} (${swap.status})`);
-        if (swap.txHash) log("dca", `  TX: ${swap.txHash}`);
-        if (swap.pollUrl) log("dca", `  Status: ${swap.pollUrl}`);
+        saveHistory(history);
       }
-    } catch (e: any) {
-      if (opts.json) {
-        logJson({ strategy: "dca", action: "failed", error: e.message, ...result });
-      } else {
-        log("dca", `FAILED: ${e.message}`);
-      }
+      markExecutionAccounted(intent.id);
+    }
+
+    const action = result.executed
+      ? "confirmed"
+      : intent.phase === "failed"
+        ? "failed"
+        : intent.phase;
+    if (opts.json) {
+      logJson({
+        strategy: "dca",
+        action,
+        intentId: intent.id,
+        simulation: receipt.simulation,
+        error: intent.error,
+        ...result,
+      });
+    } else if (result.executed) {
+      log("dca", `CONFIRMED: ${result.amount} USDC → ${intent.actualToAmount} ${token} | Swap ${intent.swapId}`);
+      if (intent.txHash) log("dca", `  TX: ${intent.txHash}`);
+    } else if (intent.phase === "failed") {
+      log("dca", `NOT EXECUTED: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+    } else if (intent.phase === "outcome_unknown") {
+      log("dca", `OUTCOME UNKNOWN: intent ${intent.id}. The same idempotency key will be reused; do not create a replacement trade.`);
+      if (intent.error) log("dca", `  ${intent.error}`);
+    } else if (intent.phase === "completed") {
+      log("dca", `COMPLETED swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; accounting remains on hold until reconciliation returns them.`);
+    } else {
+      log("dca", `SUBMITTED: intent ${intent.id}${intent.swapId ? ` | Swap ${intent.swapId}` : ""} (${intent.swapStatus ?? intent.phase})`);
+      log("dca", "  Not counted as a fill yet; rerun to reconcile status.");
     }
   }
 

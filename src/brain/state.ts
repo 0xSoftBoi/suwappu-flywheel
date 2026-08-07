@@ -7,8 +7,18 @@ import { join } from "path";
 import { homedir } from "os";
 
 const STATE_DIR = join(homedir(), ".suwappu-flywheel");
-const STATE_FILE = join(STATE_DIR, "state.json");
-const DCA_HISTORY_FILE = join(STATE_DIR, "dca-history.json");
+
+function configuredStateDir(): string {
+  return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? STATE_DIR;
+}
+
+function configuredStateFile(): string {
+  return join(configuredStateDir(), "state.json");
+}
+
+function configuredDcaHistoryFile(): string {
+  return join(configuredStateDir(), "dca-history.json");
+}
 
 export interface TradeRecord {
   id: string;
@@ -22,6 +32,8 @@ export interface TradeRecord {
   fearIndex: number;
   dayOfWeek: string;
   txHash?: string;
+  intentId?: string;
+  swapId?: string;
   // Backfilled later:
   priceAfter1h?: number;
   priceAfter24h?: number;
@@ -90,8 +102,8 @@ export function defaultState(): FlywheelState {
 
 export function loadState(): FlywheelState {
   try {
-    if (existsSync(STATE_FILE)) {
-      const state = JSON.parse(readFileSync(STATE_FILE, "utf-8")) as FlywheelState;
+    if (existsSync(configuredStateFile())) {
+      const state = JSON.parse(readFileSync(configuredStateFile(), "utf-8")) as FlywheelState;
       // Ensure new fields exist (backward compat)
       if (!state.portfolio.startingCapital) state.portfolio.startingCapital = 50;
       if (state.portfolio.usdcBalance === undefined) state.portfolio.usdcBalance = 0;
@@ -103,9 +115,10 @@ export function loadState(): FlywheelState {
 }
 
 export function saveState(state: FlywheelState): void {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
+  const dir = configuredStateDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   state.lastRun = new Date().toISOString();
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  writeFileSync(configuredStateFile(), JSON.stringify(state, null, 2));
 }
 
 export function recordTrade(
@@ -150,8 +163,8 @@ export function recordTrade(
 export function syncFromDCAHistory(state: FlywheelState): number {
   let synced = 0;
   try {
-    if (!existsSync(DCA_HISTORY_FILE)) return 0;
-    const history = JSON.parse(readFileSync(DCA_HISTORY_FILE, "utf-8")) as Array<{
+    if (!existsSync(configuredDcaHistoryFile())) return 0;
+    const history = JSON.parse(readFileSync(configuredDcaHistoryFile(), "utf-8")) as Array<{
       timestamp: string;
       token: string;
       amount: string;
@@ -159,6 +172,10 @@ export function syncFromDCAHistory(state: FlywheelState): number {
       toAmount: string;
       chain: string;
       fearIndex?: number;
+      executionStatus?: string;
+      intentId?: string;
+      swapId?: string;
+      txHash?: string;
     }>;
 
     // Build set of existing trade timestamps to avoid duplicates
@@ -169,6 +186,10 @@ export function syncFromDCAHistory(state: FlywheelState): number {
     );
 
     for (const entry of history) {
+      // Before the execution journal existed, DCA history was written as soon
+      // as a submission was accepted. Those legacy rows cannot prove a fill.
+      if (entry.executionStatus !== "completed" && entry.executionStatus !== "confirmed") continue;
+
       // Skip if already in brain state (match by timestamp)
       if (existingTimestamps.has(entry.timestamp)) continue;
 
@@ -192,6 +213,9 @@ export function syncFromDCAHistory(state: FlywheelState): number {
         priceAtEntry: entry.price,
         fearIndex: entry.fearIndex ?? 50,
         dayOfWeek: new Date(entry.timestamp).toLocaleDateString("en-US", { weekday: "long" }),
+        intentId: entry.intentId,
+        swapId: entry.swapId,
+        txHash: entry.txHash,
       });
 
       state.portfolio.totalInvested += parseFloat(entry.amount);

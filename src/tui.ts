@@ -304,7 +304,9 @@ interface AppState {
   toast: { message: string; type: "info" | "success" | "error"; expiresAt: number } | null;
 }
 
-const DRY_RUN = process.argv.includes("--dry-run");
+// Match the CLI safety contract: paper/read-only unless live execution is an
+// explicit opt-in. The old `--dry-run` flag remains harmlessly compatible.
+const DRY_RUN = !process.argv.includes("--execute");
 
 const state: AppState = {
   view: "dashboard",
@@ -521,7 +523,8 @@ async function loadPredictData() {
       question: p.question.length > 50 ? p.question.slice(0, 47) + "..." : p.question,
       yes: p.yesPrice,
       no: p.noPrice,
-      mispricing: p.mispricing,
+      // TUI percentage fields use percentage points; scanner returns a 0-1 fraction.
+      mispricing: p.mispricing * 100,
       volume: p.volume,
     }));
   } catch (e: any) {
@@ -551,13 +554,13 @@ async function executeArbOpp(opp: { token: string; buy: string; sell: string; sp
     viable: opp.viable,
   };
 
-  push(`${t.accent}\u25b8 Executing arb: ${opp.token} ${opp.buy} \u2192 ${opp.sell} (spread ${fmtPct(opp.spread)})${c.reset}`);
+  push(`${t.accent}\u25b8 Previewing arb route: ${opp.token} ${opp.buy} \u2192 ${opp.sell} (spread ${fmtPct(opp.spread)})${c.reset}`);
   push("");
 
-  const result = await silencedAsync(() => executeArb(client, arbOpp, { amount: 100, dryRun: state.dryRun, json: true }));
+  const result = await silencedAsync(() => executeArb(client, arbOpp, { amount: 100, dryRun: true, json: true }));
 
   if (result.dryRun) {
-    push(`${t.warning}DRY RUN${c.reset}`);
+    push(`${t.warning}QUOTE-ONLY PREVIEW${c.reset}`);
     push(`  Would buy ${result.toAmount ?? "?"} ${opp.token} on ${opp.buy} for $${result.amount}`);
     push(`  Then bridge to ${opp.sell} and sell`);
     push(`  Est. spread: ${fmtPct(opp.spread)} | Est. profit/1K: ${fmtUsd(opp.profit)}`);
@@ -622,7 +625,10 @@ async function executeRun() {
       push(`  Fear: ${fearMult}x | RSI: ${rsiMult}x | Brain: ${brainMult.toFixed(2)}x \u2192 $${amount}${capNote}`);
       const dcaResult = await silencedAsync(() => executeDCA(client, { token: "ETH", amount: String(amount), chain: "base", dryRun: state.dryRun, json: true }));
       if (dcaResult.executed) {
+        syncFromDCAHistory(brainState);
         push(`  ${t.positive}\u2713 Bought ${dcaResult.toAmount} ETH @ ${fmtUsd(dcaResult.price)}${c.reset}`);
+      } else if (dcaResult.submitted) {
+        push(`  ${t.warning}\u23f3 Submitted${dcaResult.swapId ? ` swap ${dcaResult.swapId}` : ""}; waiting for confirmation${c.reset}`);
       } else if (dcaResult.skipped) {
         push(`  ${t.warning}\u26a0 Skipped: ${dcaResult.skipReason}${c.reset}`);
       }
@@ -810,7 +816,7 @@ function renderFooter(view: View, layout: Layout): string {
     keys = [
       { key: "ESC", label: "Back" },
       { key: "j/k", label: "Select" },
-      { key: "E", label: "Execute" },
+      { key: "E", label: "Preview" },
       { key: "F", label: "Refresh" },
       { key: "H", label: "Help" },
       { key: "Q", label: "Quit" },
@@ -980,7 +986,7 @@ function renderArb(layout: Layout): string {
     out += text(3, row + 1, `${t.warning}Scanning across chains...${c.reset}`);
   } else {
     out += text(3, row + 1,
-      `${t.label}Opportunities${c.reset} ${state.arbOpps.length}  ${t.label}Viable${c.reset} ${viable > 0 ? `${t.positive}${viable}` : `${t.muted}0`}${c.reset}  ${t.label}Best${c.reset} ${best.spread > 0 ? `${t.positive}${fmtPct(best.spread)}${c.reset} ${t.muted}(${best.token} ${best.buy}\u2192${best.sell})${c.reset}` : `${t.muted}none${c.reset}`}`
+      `${t.label}Opportunities${c.reset} ${state.arbOpps.length}  ${t.label}Est. positive${c.reset} ${viable > 0 ? `${t.positive}${viable}` : `${t.muted}0`}${c.reset}  ${t.label}Best spread${c.reset} ${best.spread > 0 ? `${t.positive}${fmtPct(best.spread)}${c.reset} ${t.muted}(${best.token} ${best.buy}\u2192${best.sell})${c.reset}` : `${t.muted}none${c.reset}`}`
     );
   }
   row += 4;
@@ -999,7 +1005,7 @@ function renderArb(layout: Layout): string {
   for (let i = 0; i < state.arbOpps.length; i++) {
     const opp = state.arbOpps[i];
     const spreadColor = opp.viable ? t.positive : opp.spread > 0 ? t.warning : t.negative;
-    const status = opp.viable ? `${t.positive}VIABLE${c.reset}` : `${t.muted}low${c.reset}`;
+    const status = opp.viable ? `${t.positive}EST +${c.reset}` : `${t.muted}est -${c.reset}`;
     const cursor = i === state.arbSelectedIdx ? `${t.accent}\u25b6 ${c.reset}` : "  ";
     const highlight = i === state.arbSelectedIdx ? `${CSI}48;5;236m` : "";
     out += text(3, row,
@@ -1059,30 +1065,30 @@ function renderPredict(layout: Layout): string {
   let row = layout.contentStart + 1;
 
   // Summary
-  const mispriced = state.predictions.filter((p) => p.mispricing > 2).length;
-  const bestEdge = state.predictions.reduce((b, p) => Math.max(b, p.mispricing), 0);
+  const deviating = state.predictions.filter((p) => p.mispricing > 2).length;
+  const largestDeviation = state.predictions.reduce((b, p) => Math.max(b, p.mispricing), 0);
 
   out += box(1, row, w, 3, { title: "PREDICTION MARKETS", subtitle: "MONITOR", color: t.borderActive });
   if (state.loading) {
     out += text(3, row + 1, `${t.warning}Scanning Polymarket...${c.reset}`);
   } else {
     out += text(3, row + 1,
-      `${t.label}Markets${c.reset} ${state.predictions.length}  ${t.label}Mispriced (>2%)${c.reset} ${mispriced > 0 ? `${t.positive}${mispriced}` : `${t.muted}0`}${c.reset}  ${t.label}Best Edge${c.reset} ${bestEdge > 0 ? `${t.positive}${fmtPct(bestEdge)}${c.reset}` : `${t.muted}none${c.reset}`}`
+      `${t.label}Markets${c.reset} ${state.predictions.length}  ${t.label}Deviations (>2%)${c.reset} ${deviating > 0 ? `${t.warning}${deviating}` : `${t.muted}0`}${c.reset}  ${t.label}Largest${c.reset} ${largestDeviation > 0 ? `${t.warning}${fmtPct(largestDeviation)}${c.reset}` : `${t.muted}none${c.reset}`}`
     );
   }
   row += 4;
 
   if (state.loading || state.predictions.length === 0) return out;
 
-  out += text(3, row, `${t.label}${pad("Market", 52)} ${pad("YES", 6)} ${pad("NO", 6)} ${pad("Edge", 8)} ${pad("Vol", 8)}${c.reset}`);
+  out += text(3, row, `${t.label}${pad("Market", 52)} ${pad("YES", 6)} ${pad("NO", 6)} ${pad("Deviation", 10)} ${pad("Vol", 8)}${c.reset}`);
   row++;
   out += text(3, row, `${t.border}${"─".repeat(82)}${c.reset}`);
   row++;
 
   for (const p of state.predictions) {
-    const edgeColor = p.mispricing > 2 ? t.positive : p.mispricing > 0 ? t.warning : t.muted;
+    const edgeColor = p.mispricing > 2 ? t.warning : p.mispricing > 0 ? t.label : t.muted;
     out += text(3, row,
-      `${pad(p.question, 52)} ${pad(`${(p.yes * 100).toFixed(0)}\u00a2`, 6)} ${pad(`${(p.no * 100).toFixed(0)}\u00a2`, 6)} ${edgeColor}${pad(fmtPct(p.mispricing), 8)}${c.reset} ${pad(p.volume, 8)}`
+      `${pad(p.question, 52)} ${pad(`${(p.yes * 100).toFixed(0)}\u00a2`, 6)} ${pad(`${(p.no * 100).toFixed(0)}\u00a2`, 6)} ${edgeColor}${pad(fmtPct(p.mispricing), 10)}${c.reset} ${pad(p.volume, 8)}`
     );
     row++;
   }
@@ -1188,21 +1194,17 @@ function renderConfirmArb(layout: Layout): string {
   const x = Math.floor((layout.width - w) / 2);
   const y = Math.floor((layout.height - h) / 2);
 
-  out += box(x, y, w, h, { title: "EXECUTE ARB", color: t.warning });
+  out += box(x, y, w, h, { title: "PREVIEW ARB", color: t.warning });
   let row = y + 2;
   out += text(x + 3, row, `${t.value}${opp.token}${c.reset} ${opp.buy} \u2192 ${opp.sell}  spread ${fmtPctColor(opp.spread)}`);
   row++;
   out += text(x + 3, row, `${t.label}Est. profit/1K:${c.reset} ${opp.profit > 0 ? `${t.positive}${fmtUsd(opp.profit)}` : `${t.negative}${fmtUsd(opp.profit)}`}${c.reset}`);
   row++;
-  if (state.dryRun) {
-    out += text(x + 3, row, `${t.accent}DRY RUN mode \u2014 no real trade${c.reset}`);
-  } else {
-    out += text(x + 3, row, `${t.warning}LIVE \u2014 will execute buy leg on ${opp.buy}${c.reset}`);
-    row++;
-    out += text(x + 3, row, `${t.muted}Bridge + sell on ${opp.sell} is manual${c.reset}`);
-  }
+  out += text(x + 3, row, `${t.accent}QUOTE ONLY \u2014 no real trade${c.reset}`);
+  row++;
+  out += text(x + 3, row, `${t.muted}Two-leg/bridge execution is intentionally not implemented${c.reset}`);
   row += 2;
-  out += text(x + 3, row, `${t.positive}[Y]${c.reset} Execute  ${t.negative}[N]${c.reset} Cancel`);
+  out += text(x + 3, row, `${t.positive}[Y]${c.reset} Preview  ${t.negative}[N]${c.reset} Cancel`);
 
   return out;
 }
@@ -1242,7 +1244,7 @@ function renderHelp(layout: Layout): string {
     ["P", "Prediction markets (monitor)"],
     ["T", "Trade history"],
     ["R", "Run flywheel cycle"],
-    ["E", "Execute selected arb"],
+    ["E", "Preview selected arb quote"],
     ["F", "Refresh current view"],
     ["H", "Toggle this help"],
     ["j / \u2193", "Select / Scroll down"],

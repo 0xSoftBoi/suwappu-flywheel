@@ -57,7 +57,8 @@ export async function scanYield(
       const best = opportunities[0];
       console.log();
       log("yield", `Best: ${best.pair} at ${best.supplyApy.toFixed(2)}% APY`);
-      log("yield", `$100 deposited here earns ~${formatUsd((100 * best.supplyApy) / 100)}/year`);
+      log("yield", `$100 would imply ~${formatUsd((100 * best.supplyApy) / 100)} over one year only if this APY stayed constant`);
+      log("yield", "APY is a snapshot, not guaranteed return; review incentives, oracle/collateral, liquidity, and protocol risk before depositing.");
     }
   }
 

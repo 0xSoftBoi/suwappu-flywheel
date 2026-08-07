@@ -1,7 +1,6 @@
-FROM oven/bun:1
+FROM oven/bun:1.3.14
 WORKDIR /app
-COPY package.json bun.lockb* ./
-RUN bun install --frozen-lockfile || bun install
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile
 COPY . .
-HEALTHCHECK --interval=300s CMD echo "ok"
-CMD ["bun", "run", "src/cli.ts", "run", "--dry-run"]
+CMD ["bun", "run", "src/cli.ts", "run"]

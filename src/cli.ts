@@ -26,12 +26,13 @@ import { executeDCA, getFearIndex, fearMultiplier } from "./strategies/dca.js";
 import { scanArb } from "./strategies/arb.js";
 import { scanPredictions } from "./strategies/predict.js";
 import { checkGrid, resetGrid } from "./strategies/grid.js";
-import { loadState, saveState, recordTrade, syncFromDCAHistory, updatePortfolio } from "./brain/state.js";
+import { loadState, saveState, syncFromDCAHistory, updatePortfolio } from "./brain/state.js";
 import { getUSDCBalance, getETHBalance } from "./strategies/dca.js";
 import { getCandles, calcRSI, rsiMultiplier, calcATRPct } from "./indicators.js";
 import { backfillRewards } from "./brain/reward.js";
 import { adaptParameters, logAgentState } from "./brain/adapt.js";
 import { generatePortfolioReport, getRecommendedSize, formatPortfolioReport } from "./portfolio.js";
+import { listExecutionJournal, reconcileExecutionJournal } from "./execution.js";
 
 function getClient() {
   return createClient({ apiKey: requireEnv("SUWAPPU_API_KEY") });
@@ -39,7 +40,7 @@ function getClient() {
 
 const program = new Command()
   .name("suwappu-flywheel")
-  .description("Multi-strategy DeFi agent built on the Suwappu SDK and API")
+  .description("Suwappu strategy lab and outcome-safe managed-execution reference")
   .version("1.0.0");
 
 // ── Yield ──
@@ -67,12 +68,6 @@ program.command("dca").description("Execute a DCA buy (or dry-run)")
       const dryRun = !opts.execute;
       let amount = opts.amount;
 
-      const maxTradeUsd = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD || '1000');
-      if (parseFloat(amount) > maxTradeUsd) {
-        console.error(`Error: amount ${amount} exceeds max allowed ${maxTradeUsd}. Set SUWAPPU_MAX_TRADE_USD to override.`);
-        process.exit(1);
-      }
-
       if (opts.fearAdjust) {
         const fear = await getFearIndex();
         const mult = fearMultiplier(fear.value);
@@ -80,6 +75,12 @@ program.command("dca").description("Execute a DCA buy (or dry-run)")
         if (!opts.json) {
           log("dca", `Fear Index: ${fear.value}/100 (${fear.classification}) → ${mult}x multiplier → ${amount} USDC`);
         }
+      }
+
+      const maxTradeUsd = parseFloat(process.env.SUWAPPU_MAX_TRADE_USD || "1000");
+      if (!dryRun && parseFloat(amount) > maxTradeUsd) {
+        console.error(`Error: adjusted amount ${amount} exceeds live max ${maxTradeUsd}. Set SUWAPPU_MAX_TRADE_USD deliberately to override.`);
+        process.exit(1);
       }
 
       await executeDCA(client, { ...opts, amount, dryRun });
@@ -98,7 +99,7 @@ program.command("arb").description("Scan for cross-chain price opportunities")
   });
 
 // ── Predict ──
-program.command("predict").description("Scout prediction markets for mispricing")
+program.command("predict").description("Screen prediction markets for YES+NO price-sum deviations")
   .option("--top <n>", "number of markets", parseInt, 10)
   .option("--json", "JSON output")
   .action(async (opts) => {
@@ -153,6 +154,33 @@ program.command("status").description("Portfolio dashboard")
     } catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
   });
 
+// ── Execution journal ──
+program.command("executions").description("Inspect durable managed-execution intents and reconciliation state")
+  .option("--limit <n>", "number of recent intents", parseInt, 20)
+  .option("--reconcile", "poll known swap IDs before printing (never submits a trade)")
+  .option("--json", "JSON output")
+  .action(async (opts) => {
+    try {
+      const entries = opts.reconcile
+        ? await reconcileExecutionJournal(requireEnv("SUWAPPU_API_KEY"))
+        : listExecutionJournal(opts.limit);
+      const limited = entries.slice(0, opts.limit);
+      if (opts.json) {
+        console.log(JSON.stringify({ executions: limited }, null, 2));
+        return;
+      }
+      if (limited.length === 0) {
+        log("executions", "No managed execution intents recorded yet.");
+        return;
+      }
+      for (const entry of limited) {
+        const swap = entry.swapId ? ` swap=${entry.swapId}` : "";
+        const accounted = entry.accountedAt ? " accounted" : "";
+        console.log(`${entry.createdAt}  ${entry.strategy}/${entry.actionKey}  ${entry.phase}${swap}${accounted}  intent=${entry.id}`);
+      }
+    } catch (e: any) { console.error(`Error: ${e.message}`); process.exit(1); }
+  });
+
 // ── Watch (continuous monitoring) ──
 program.command("watch").description("Continuously scan for opportunities")
   .option("--interval <secs>", "scan interval in seconds", parseInt, 300)
@@ -193,7 +221,7 @@ program.command("watch").description("Continuously scan for opportunities")
 
         const viable = opps.filter((o) => o.viable);
         if (viable.length > 0 && !opts.json) {
-          log("watch", `🚨 ${viable.length} PROFITABLE arb opportunity(ies) found!`);
+          log("watch", `🔎 ${viable.length} arb spread(s) are positive under the scanner's estimate; verify both legs before acting.`);
         }
 
         if (!opts.json) console.log();
@@ -381,29 +409,17 @@ program.command("run").description("Run full flywheel: DCA buy + Grid sell + Bra
         // Skip if RSI says overbought
         if (rsiMult === 0 && effectiveAmount === 0) {
           if (!opts.json) log("dca", "Skipped (overbought)");
-        }
-
-        const dcaResult = await executeDCA(client, {
-          token: "ETH",
-          amount: String(effectiveAmount),
-          chain: "base",
-          dryRun,
-          json: opts.json,
-        });
-
-        // Record trade in brain state (only for real executions)
-        if (dcaResult.executed) {
-          recordTrade(state, {
-            timestamp: new Date().toISOString(),
-            strategy: "dca",
+        } else {
+          const dcaResult = await executeDCA(client, {
             token: "ETH",
+            amount: String(effectiveAmount),
             chain: "base",
-            amountIn: effectiveAmount,
-            amountOut: parseFloat(dcaResult.toAmount || "0"),
-            priceAtEntry: dcaResult.price,
-            fearIndex: fear.value,
-            txHash: dcaResult.txHash,
+            dryRun,
+            json: opts.json,
           });
+          // Confirmed DCA history is the accounting source of truth. Sync it
+          // instead of manufacturing a second trade record from the quote.
+          if (dcaResult.executed) syncFromDCAHistory(state);
         }
       }
 

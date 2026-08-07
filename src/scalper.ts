@@ -6,7 +6,13 @@
  */
 import { createClient } from "@suwappu/sdk";
 import { requireEnv, log } from "./utils.js";
-import { executeManagedSwap } from "./suwappu.js";
+import {
+  getUnaccountedExecution,
+  markExecutionAccounted,
+  runManagedExecution,
+  type EconomicTerms,
+  type ExecutionIntent,
+} from "./execution.js";
 import { calcRSI, calcATRPct } from "./indicators.js";
 import { getFearIndex } from "./strategies/dca.js";
 import { calculateKelly } from "./portfolio.js";
@@ -16,9 +22,17 @@ import { join } from "path";
 import { homedir } from "os";
 
 // ── Constants ──
-const STATE_DIR = join(homedir(), ".suwappu-flywheel");
-const TRAINING_FILE = join(STATE_DIR, "training-data.jsonl");
-const SCALPER_STATE_FILE = join(STATE_DIR, "scalper-state.json");
+function stateDir(): string {
+  return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? join(homedir(), ".suwappu-flywheel");
+}
+
+function trainingFile(): string {
+  return join(stateDir(), "training-data.jsonl");
+}
+
+function scalperStateFile(dryRun: boolean): string {
+  return join(stateDir(), dryRun ? "scalper-paper-state.json" : "scalper-live-state.json");
+}
 const BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines";
 const BINANCE_TICKER = "https://data-api.binance.vision/api/v3/ticker/price";
 
@@ -88,6 +102,7 @@ interface TrainingSample {
   pos_age_s: number;
   action: "buy" | "sell" | "hold";
   reward_5m: number | null;
+  mode: "paper" | "live";
 }
 
 interface ScalperPosition {
@@ -97,6 +112,8 @@ interface ScalperPosition {
   ethAmount: number;
   highWatermark: number;
   txHash?: string;
+  intentId?: string;
+  swapId?: string;
 }
 
 interface ClosedTrade {
@@ -107,6 +124,8 @@ interface ClosedTrade {
   entryTime: string;
   exitTime: string;
   txHash?: string;
+  intentId?: string;
+  swapId?: string;
 }
 
 interface ScalperState {
@@ -138,10 +157,10 @@ function defaultScalperState(): ScalperState {
   };
 }
 
-function loadScalperState(): ScalperState {
+function loadScalperState(dryRun: boolean): ScalperState {
   try {
-    if (existsSync(SCALPER_STATE_FILE)) {
-      const s = JSON.parse(readFileSync(SCALPER_STATE_FILE, "utf-8")) as ScalperState;
+    if (existsSync(scalperStateFile(dryRun))) {
+      const s = JSON.parse(readFileSync(scalperStateFile(dryRun), "utf-8")) as ScalperState;
       // Reset hourly counter
       const now = new Date();
       if (new Date(s.hourStart).getHours() !== now.getHours()) {
@@ -160,9 +179,9 @@ function loadScalperState(): ScalperState {
   return defaultScalperState();
 }
 
-function saveScalperState(s: ScalperState) {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(SCALPER_STATE_FILE, JSON.stringify(s, null, 2));
+function saveScalperState(s: ScalperState, dryRun: boolean) {
+  if (!existsSync(stateDir())) mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(scalperStateFile(dryRun), JSON.stringify(s, null, 2));
 }
 
 // ── Binance data ──
@@ -321,53 +340,131 @@ export function decideAction(
 }
 
 // ── Execution ──
-async function executeBuy(apiKey: string, amount: number, dryRun: boolean) {
+async function runScalperManaged(
+  apiKey: string,
+  actionKey: "buy" | "sell",
+  terms: EconomicTerms,
+): Promise<ExecutionIntent> {
   const client = createClient({ apiKey });
-  const quote = await client.getQuote("USDC", "ETH", amount, "base");
-
-  if (dryRun) {
-    return { success: true, ethAmount: parseFloat(quote.toAmount), price: amount / parseFloat(quote.toAmount), txHash: "dry-run" };
-  }
-
-  const swap = await executeManagedSwap(apiKey, quote.id);
-  return {
-    success: true,
-    ethAmount: parseFloat(quote.toAmount),
-    price: amount / parseFloat(quote.toAmount),
-    txHash: swap.txHash,
-    swapId: swap.swapId,
-    status: swap.status,
-  };
+  const receipt = await runManagedExecution({
+    apiKey,
+    strategy: "scalper",
+    actionKey,
+    terms,
+    getQuote: async () => {
+      const quote = await client.getQuote(
+        terms.fromToken,
+        terms.toToken,
+        parseFloat(terms.amount),
+        terms.chain,
+      );
+      return { id: quote.id, toAmount: quote.toAmount };
+    },
+    walletAddress: process.env.SUWAPPU_MANAGED_WALLET_ADDRESS,
+  });
+  return receipt.intent;
 }
 
-async function executeSell(apiKey: string, ethAmount: number, dryRun: boolean) {
-  if (dryRun) {
-    return { success: true, usdcReceived: ethAmount * 2100, price: 2100, txHash: "dry-run" };
-  }
+async function paperBuy(apiKey: string, amount: number) {
+  const client = createClient({ apiKey });
+  const quote = await client.getQuote("USDC", "ETH", amount, "base");
+  const ethAmount = parseFloat(quote.toAmount);
+  return { ethAmount, price: amount / ethAmount, txHash: "paper" };
+}
 
+async function paperSell(apiKey: string, ethAmount: number) {
   const client = createClient({ apiKey });
   const quote = await client.getQuote("ETH", "USDC", ethAmount, "base");
-  const swap = await executeManagedSwap(apiKey, quote.id);
-  return {
-    success: true,
-    usdcReceived: parseFloat(quote.toAmount),
-    price: parseFloat(quote.toAmount) / ethAmount,
-    txHash: swap.txHash,
-    swapId: swap.swapId,
-    status: swap.status,
+  const usdcReceived = parseFloat(quote.toAmount);
+  return { usdcReceived, price: usdcReceived / ethAmount, txHash: "paper" };
+}
+
+function applyConfirmedBuy(state: ScalperState, intent: ExecutionIntent, marketPrice: number): boolean {
+  if (intent.phase !== "completed" || !intent.actualFromAmount || !intent.actualToAmount) return false;
+  if (state.position?.intentId === intent.id) return true;
+  if (state.position) return false;
+
+  const usdcSpent = parseFloat(intent.actualFromAmount);
+  const ethAmount = parseFloat(intent.actualToAmount);
+  if (!Number.isFinite(usdcSpent) || usdcSpent <= 0 || !Number.isFinite(ethAmount) || ethAmount <= 0) return false;
+  const fillPrice = usdcSpent / ethAmount;
+  state.position = {
+    entryPrice: fillPrice,
+    entryTime: intent.createdAt,
+    amount: usdcSpent,
+    ethAmount,
+    highWatermark: Math.max(fillPrice, marketPrice),
+    txHash: intent.txHash,
+    intentId: intent.id,
+    swapId: intent.swapId,
   };
+  state.tradesThisHour++;
+  log("scalper", `BUY CONFIRMED $${usdcSpent.toFixed(2)} → ${ethAmount.toFixed(6)} ETH @ $${fillPrice.toFixed(2)}`);
+  return true;
+}
+
+function applyConfirmedSell(state: ScalperState, intent: ExecutionIntent): boolean {
+  if (intent.phase !== "completed" || !intent.actualFromAmount || !intent.actualToAmount) return false;
+  if (state.closedTrades.some((trade) => trade.intentId === intent.id)) return true;
+  if (!state.position) return false;
+
+  const ethSold = parseFloat(intent.actualFromAmount);
+  const usdcReceived = parseFloat(intent.actualToAmount);
+  if (!Number.isFinite(ethSold) || ethSold <= 0 || !Number.isFinite(usdcReceived) || usdcReceived < 0) return false;
+
+  const position = state.position;
+  const fractionSold = Math.min(1, ethSold / position.ethAmount);
+  const costBasis = position.amount * fractionSold;
+  const pnl = usdcReceived - costBasis;
+  const pnlPct = costBasis > 0 ? pnl / costBasis : 0;
+  const fillPrice = usdcReceived / ethSold;
+  const exitTime = new Date().toISOString();
+
+  state.dailyPnL += pnl;
+  state.totalPnL += pnl;
+  state.totalTrades++;
+  if (pnl > 0) state.wins++;
+  if (pnl < 0) state.lastLossTime = exitTime;
+  state.closedTrades.push({
+    entryPrice: position.entryPrice,
+    exitPrice: fillPrice,
+    pnl,
+    pnlPct,
+    entryTime: position.entryTime,
+    exitTime,
+    txHash: intent.txHash,
+    intentId: intent.id,
+    swapId: intent.swapId,
+  });
+  if (state.closedTrades.length > 100) state.closedTrades = state.closedTrades.slice(-100);
+  backfillTradeReward(position.entryTime, exitTime, pnlPct, "live");
+
+  const remainingEth = Math.max(0, position.ethAmount - ethSold);
+  if (remainingEth > 1e-9) {
+    position.ethAmount = remainingEth;
+    position.amount = Math.max(0, position.amount - costBasis);
+  } else {
+    state.position = null;
+  }
+  log("scalper", `SELL CONFIRMED ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(3)} (${(pnlPct * 100).toFixed(2)}%) @ $${fillPrice.toFixed(2)}`);
+  return true;
 }
 
 // ── Training data ──
 function appendSample(sample: TrainingSample) {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  appendFileSync(TRAINING_FILE, JSON.stringify(sample) + "\n");
+  if (!existsSync(stateDir())) mkdirSync(stateDir(), { recursive: true });
+  appendFileSync(trainingFile(), JSON.stringify(sample) + "\n");
 }
 
-function backfillTradeReward(entryTime: string, exitTime: string, pnlPct: number) {
-  if (!existsSync(TRAINING_FILE)) return;
+function backfillTradeReward(
+  entryTime: string,
+  exitTime: string,
+  pnlPct: number,
+  mode: "paper" | "live",
+) {
+  if (!existsSync(trainingFile())) return;
   try {
-    const lines = readFileSync(TRAINING_FILE, "utf-8").split("\n").filter(Boolean);
+    const lines = readFileSync(trainingFile(), "utf-8").split("\n").filter(Boolean);
     const entryMs = new Date(entryTime).getTime();
     const exitMs = new Date(exitTime).getTime();
     let modified = false;
@@ -376,7 +473,7 @@ function backfillTradeReward(entryTime: string, exitTime: string, pnlPct: number
       try {
         const sample = JSON.parse(line) as TrainingSample;
         const ts = new Date(sample.ts).getTime();
-        if (ts >= entryMs && ts <= exitMs && sample.reward_5m === null) {
+        if (sample.mode === mode && ts >= entryMs && ts <= exitMs && sample.reward_5m === null) {
           sample.reward_5m = pnlPct;
           modified = true;
           return JSON.stringify(sample);
@@ -386,7 +483,7 @@ function backfillTradeReward(entryTime: string, exitTime: string, pnlPct: number
     });
 
     if (modified) {
-      writeFileSync(TRAINING_FILE, updated.join("\n") + "\n");
+      writeFileSync(trainingFile(), updated.join("\n") + "\n");
     }
   } catch {}
 }
@@ -442,16 +539,19 @@ export async function runScalper(opts: {
   interval: number;
   dryRun: boolean;
 }) {
+  if (!opts.dryRun && !opts.execute) {
+    throw new Error("Live scalper mode requires execute=true; use dryRun=true for paper mode");
+  }
   const apiKey = requireEnv("SUWAPPU_API_KEY");
-  const state = loadScalperState();
+  const state = loadScalperState(opts.dryRun);
   let tickNum = 0;
   let cachedFear = 8;
   let lastFearFetch = 0;
 
-  log("scalper", `Starting — ${opts.dryRun ? "DRY RUN" : "LIVE"} | $${opts.amount}/trade | ${opts.interval}s interval`);
+  log("scalper", `Starting — ${opts.dryRun ? "PAPER" : "LIVE"} | $${opts.amount}/trade | ${opts.interval}s interval`);
 
   const shutdown = () => {
-    saveScalperState(state);
+    saveScalperState(state, opts.dryRun);
     log("scalper", `Stopped. ${state.totalTrades} trades, P&L: $${state.totalPnL.toFixed(2)}`);
     process.exit(0);
   };
@@ -491,57 +591,126 @@ export async function runScalper(opts: {
         state.position.highWatermark = price;
       }
 
-      // Decide
-      const action = decideAction(signals, state.position, state);
+      // Resolve an earlier live submission before considering a new action.
+      // Pending/outcome-unknown swaps own this tick so a changing signal can
+      // never create a replacement trade with a new idempotency key.
+      let action: "buy" | "sell" | "hold" = "hold";
+      let hadPendingExecution = false;
+      if (!opts.dryRun) {
+        const pending = getUnaccountedExecution("scalper");
+        if (pending) {
+          hadPendingExecution = true;
+          if (pending.actionKey !== "buy" && pending.actionKey !== "sell") {
+            log("scalper", `Unknown pending action ${pending.actionKey}; refusing new trades`);
+          } else {
+            try {
+              const reconciled = await runScalperManaged(apiKey, pending.actionKey, pending.terms);
+              if (reconciled.phase === "completed") {
+                const applied = reconciled.actionKey === "buy"
+                  ? applyConfirmedBuy(state, reconciled, price)
+                  : applyConfirmedSell(state, reconciled);
+                if (applied) {
+                  saveScalperState(state, false);
+                  markExecutionAccounted(reconciled.id);
+                } else {
+                  log("scalper", `Swap ${reconciled.swapId ?? reconciled.id} completed but final amounts/state could not be accounted; holding`);
+                }
+              } else if (reconciled.phase === "failed") {
+                markExecutionAccounted(reconciled.id);
+                log("scalper", `Prior ${reconciled.actionKey} was not executed: ${reconciled.error ?? reconciled.swapStatus ?? "failed"}`);
+              } else {
+                log("scalper", `Waiting on ${reconciled.actionKey} intent ${reconciled.id} (${reconciled.swapStatus ?? reconciled.phase})`);
+              }
+            } catch (error) {
+              log("scalper", `Reconciliation deferred: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+      }
+
+      if (!hadPendingExecution) action = decideAction(signals, state.position, state);
 
       // Execute
       if (action === "buy" && !state.position) {
         const tradeAmount = Math.min(opts.amount, Math.max(1, Math.floor(32 * maxFraction))); // 32 = approximate USDC balance
         try {
-          const result = await executeBuy(apiKey, tradeAmount, opts.dryRun);
-          state.position = {
-            entryPrice: result.price,
-            entryTime: new Date().toISOString(),
-            amount: tradeAmount,
-            ethAmount: result.ethAmount,
-            highWatermark: price,
-            txHash: result.txHash,
-          };
-          state.tradesThisHour++;
-          log("scalper", `BUY $${tradeAmount} → ${result.ethAmount.toFixed(6)} ETH @ $${result.price.toFixed(2)}`);
+          if (opts.dryRun) {
+            const result = await paperBuy(apiKey, tradeAmount);
+            state.position = {
+              entryPrice: result.price,
+              entryTime: new Date().toISOString(),
+              amount: tradeAmount,
+              ethAmount: result.ethAmount,
+              highWatermark: price,
+              txHash: result.txHash,
+            };
+            state.tradesThisHour++;
+            log("scalper", `PAPER BUY $${tradeAmount} → ${result.ethAmount.toFixed(6)} ETH @ $${result.price.toFixed(2)}`);
+          } else {
+            const intent = await runScalperManaged(
+              apiKey,
+              "buy",
+              { fromToken: "USDC", toToken: "ETH", amount: String(tradeAmount), chain: "base" },
+            );
+            if (applyConfirmedBuy(state, intent, price)) {
+              saveScalperState(state, false);
+              markExecutionAccounted(intent.id);
+            } else if (intent.phase === "failed") {
+              markExecutionAccounted(intent.id);
+              log("scalper", `Buy not executed: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+            } else if (intent.phase === "completed") {
+              log("scalper", `BUY completed as swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; position remains closed until they reconcile`);
+            } else {
+              log("scalper", `BUY SUBMITTED: intent ${intent.id}${intent.swapId ? ` | swap ${intent.swapId}` : ""}; position remains closed until confirmed`);
+            }
+          }
         } catch (e: any) {
           log("scalper", `Buy failed: ${e.message}`);
         }
       } else if (action === "sell" && state.position) {
         try {
-          const result = await executeSell(apiKey, state.position.ethAmount, opts.dryRun);
-          const pnl = (opts.dryRun ? state.position.ethAmount * price : result.usdcReceived) - state.position.amount;
-          const pnlPct = pnl / state.position.amount;
-
-          state.dailyPnL += pnl;
-          state.totalPnL += pnl;
-          state.totalTrades++;
-          if (pnl > 0) state.wins++;
-          if (pnl < 0) state.lastLossTime = new Date().toISOString();
-
-          state.closedTrades.push({
-            entryPrice: state.position.entryPrice,
-            exitPrice: result.price,
-            pnl,
-            pnlPct,
-            entryTime: state.position.entryTime,
-            exitTime: new Date().toISOString(),
-            txHash: result.txHash,
-          });
-
-          // Keep last 100 trades
-          if (state.closedTrades.length > 100) state.closedTrades = state.closedTrades.slice(-100);
-
-          // Backfill training data
-          backfillTradeReward(state.position.entryTime, new Date().toISOString(), pnlPct);
-
-          log("scalper", `SELL ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(3)} (${(pnlPct * 100).toFixed(2)}%) @ $${result.price.toFixed(2)}`);
-          state.position = null;
+          if (opts.dryRun) {
+            const position = state.position;
+            const result = await paperSell(apiKey, position.ethAmount);
+            const pnl = result.usdcReceived - position.amount;
+            const pnlPct = pnl / position.amount;
+            const exitTime = new Date().toISOString();
+            state.dailyPnL += pnl;
+            state.totalPnL += pnl;
+            state.totalTrades++;
+            if (pnl > 0) state.wins++;
+            if (pnl < 0) state.lastLossTime = exitTime;
+            state.closedTrades.push({
+              entryPrice: position.entryPrice,
+              exitPrice: result.price,
+              pnl,
+              pnlPct,
+              entryTime: position.entryTime,
+              exitTime,
+              txHash: result.txHash,
+            });
+            if (state.closedTrades.length > 100) state.closedTrades = state.closedTrades.slice(-100);
+            backfillTradeReward(position.entryTime, exitTime, pnlPct, "paper");
+            log("scalper", `PAPER SELL ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(3)} (${(pnlPct * 100).toFixed(2)}%) @ $${result.price.toFixed(2)}`);
+            state.position = null;
+          } else {
+            const intent = await runScalperManaged(
+              apiKey,
+              "sell",
+              { fromToken: "ETH", toToken: "USDC", amount: String(state.position.ethAmount), chain: "base" },
+            );
+            if (applyConfirmedSell(state, intent)) {
+              saveScalperState(state, false);
+              markExecutionAccounted(intent.id);
+            } else if (intent.phase === "failed") {
+              markExecutionAccounted(intent.id);
+              log("scalper", `Sell not executed: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+            } else if (intent.phase === "completed") {
+              log("scalper", `SELL completed as swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; position remains unchanged until they reconcile`);
+            } else {
+              log("scalper", `SELL SUBMITTED: intent ${intent.id}${intent.swapId ? ` | swap ${intent.swapId}` : ""}; position remains open until confirmed`);
+            }
+          }
         } catch (e: any) {
           log("scalper", `Sell failed: ${e.message}`);
         }
@@ -570,6 +739,7 @@ export async function runScalper(opts: {
         pos_age_s: state.position ? Math.floor((Date.now() - new Date(state.position.entryTime).getTime()) / 1000) : 0,
         action,
         reward_5m: null,
+        mode: opts.dryRun ? "paper" : "live",
       };
       appendSample(sample);
 
@@ -577,7 +747,7 @@ export async function runScalper(opts: {
       renderTick(signals, state.position, state, action, tickNum, opts.dryRun);
 
       // Save state every 10 ticks
-      if (tickNum % 10 === 0) saveScalperState(state);
+      if (tickNum % 10 === 0) saveScalperState(state, opts.dryRun);
 
     } catch (e: any) {
       log("scalper", `Tick error: ${e.message}`);

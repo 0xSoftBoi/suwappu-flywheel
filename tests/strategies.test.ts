@@ -1,14 +1,10 @@
 import { describe, it, expect } from "bun:test";
+import { fearMultiplier } from "../src/strategies/dca";
+import { calculateSpreadPct, estimateArbNetUsd } from "../src/strategies/arb";
+import { predictionPriceSumDeviation } from "../src/strategies/predict";
+import { isGridInventoryHistory } from "../src/strategies/grid";
 
 // ── Fear multiplier logic ──
-function fearMultiplier(value: number): number {
-  if (value <= 10) return 4.0;
-  if (value <= 25) return 2.0;
-  if (value <= 50) return 1.0;
-  if (value <= 75) return 0.5;
-  return 0.25;
-}
-
 describe("fear-adjusted DCA multiplier", () => {
   it("should 4x at extreme fear (0-10)", () => {
     expect(fearMultiplier(5)).toBe(4.0);
@@ -34,25 +30,44 @@ describe("fear-adjusted DCA multiplier", () => {
   });
 });
 
-// ── Arb spread calculation ──
-function calculateSpread(buyPrice: number, sellPrice: number): number {
-  return ((sellPrice - buyPrice) / buyPrice) * 100;
-}
+describe("grid inventory accounting", () => {
+  const confirmedEthBase = {
+    timestamp: "2026-08-07T00:00:00.000Z",
+    token: "ETH",
+    amount: "10",
+    price: 2500,
+    toAmount: "0.004",
+    chain: "base",
+    executionStatus: "completed" as const,
+  };
 
+  it("accepts only reconciled ETH buys on Base", () => {
+    expect(isGridInventoryHistory(confirmedEthBase)).toBe(true);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, token: "SOL" })).toBe(false);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, chain: "arbitrum" })).toBe(false);
+    expect(isGridInventoryHistory({ ...confirmedEthBase, executionStatus: undefined })).toBe(false);
+  });
+});
+
+// ── Arb spread calculation ──
 describe("arb spread detection", () => {
   it("should calculate positive spread", () => {
-    expect(calculateSpread(2000, 2010)).toBeCloseTo(0.5, 1);
+    expect(calculateSpreadPct(2000, 2010)).toBeCloseTo(0.5, 1);
   });
   it("should find no spread at same price", () => {
-    expect(calculateSpread(2000, 2000)).toBe(0);
+    expect(calculateSpreadPct(2000, 2000)).toBe(0);
   });
   it("should detect sub-threshold spreads", () => {
-    const spread = calculateSpread(2000, 2001);
+    const spread = calculateSpreadPct(2000, 2001);
     expect(spread < 0.1).toBe(true); // Below 0.1% threshold
   });
-  it("should detect profitable spread", () => {
-    const spread = calculateSpread(2000, 2010);
+  it("should detect a spread above the screening threshold", () => {
+    const spread = calculateSpreadPct(2000, 2010);
     expect(spread >= 0.1).toBe(true);
+  });
+  it("keeps the cost-model estimate separate from raw spread", () => {
+    // 1% gross on $1K = $10; Base→Arbitrum model cost $0.50 and 0.3% slippage $3.
+    expect(estimateArbNetUsd(1000, 1, "base", "arbitrum")).toBeCloseTo(6.5, 6);
   });
 });
 
@@ -82,20 +97,19 @@ describe("yield market sorting", () => {
   });
 });
 
-// ── Prediction mispricing ──
-describe("prediction market mispricing", () => {
-  it("should detect mispriced market (sum < 1.0)", () => {
+// ── Prediction price-sum screening ──
+describe("prediction market price-sum deviation", () => {
+  it("should detect a deviation when sum < 1.0", () => {
     const yes = 0.45, no = 0.52;
-    const sum = yes + no;
-    expect(Math.abs(sum - 1.0)).toBeGreaterThan(0.02);
+    expect(predictionPriceSumDeviation(yes, no)).toBeGreaterThan(0.02);
   });
 
-  it("should accept efficient market (sum ≈ 1.0)", () => {
+  it("should see no deviation when the sum is 1.0", () => {
     const yes = 0.65, no = 0.35;
-    expect(Math.abs(yes + no - 1.0)).toBeLessThan(0.02);
+    expect(predictionPriceSumDeviation(yes, no)).toBeLessThan(0.02);
   });
 
-  it("should flag overpriced market (sum > 1.0)", () => {
+  it("should flag a sum above 1.0", () => {
     const yes = 0.55, no = 0.48;
     expect(yes + no).toBeGreaterThan(1.0);
   });

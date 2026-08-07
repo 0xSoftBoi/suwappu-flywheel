@@ -2,4 +2,6 @@ services:
   flywheel:
     build: .
     env_file: .env
-    restart: unless-stopped
+    # `run` is one strategy cycle. Do not turn a one-shot command into an
+    # accidental tight loop (especially if a user later opts into --execute).
+    restart: "no"
