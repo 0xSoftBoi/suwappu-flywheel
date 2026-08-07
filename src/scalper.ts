@@ -539,6 +539,9 @@ export async function runScalper(opts: {
   interval: number;
   dryRun: boolean;
 }) {
+  if (!opts.dryRun && !opts.execute) {
+    throw new Error("Live scalper mode requires execute=true; use dryRun=true for paper mode");
+  }
   const apiKey = requireEnv("SUWAPPU_API_KEY");
   const state = loadScalperState(opts.dryRun);
   let tickNum = 0;
@@ -655,6 +658,8 @@ export async function runScalper(opts: {
             } else if (intent.phase === "failed") {
               markExecutionAccounted(intent.id);
               log("scalper", `Buy not executed: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+            } else if (intent.phase === "completed") {
+              log("scalper", `BUY completed as swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; position remains closed until they reconcile`);
             } else {
               log("scalper", `BUY SUBMITTED: intent ${intent.id}${intent.swapId ? ` | swap ${intent.swapId}` : ""}; position remains closed until confirmed`);
             }
@@ -700,6 +705,8 @@ export async function runScalper(opts: {
             } else if (intent.phase === "failed") {
               markExecutionAccounted(intent.id);
               log("scalper", `Sell not executed: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+            } else if (intent.phase === "completed") {
+              log("scalper", `SELL completed as swap ${intent.swapId ?? intent.id}, but final amounts are unavailable; position remains unchanged until they reconcile`);
             } else {
               log("scalper", `SELL SUBMITTED: intent ${intent.id}${intent.swapId ? ` | swap ${intent.swapId}` : ""}; position remains open until confirmed`);
             }
