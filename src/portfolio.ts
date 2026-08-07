@@ -416,7 +416,9 @@ export function getRecommendedSize(
   reasoning.push(`Fear ${marketData.fearValue}: ${fearMult}x | RSI ${marketData.rsi.toFixed(0)}: ${rsiMult}x | Brain: ${brainMult.toFixed(2)}x`);
 
   // Compute raw amount then cap with Kelly
-  const rawAmount = Math.max(1, Math.round(baseAmount * marketAdj * brainMult));
+  // A zero market multiplier is an explicit no-trade signal (for example RSI
+  // overbought). Do not let the $1 minimum turn a skip signal into a live buy.
+  const rawAmount = marketAdj === 0 ? 0 : Math.max(1, Math.round(baseAmount * marketAdj * brainMult));
   const amount = Math.min(rawAmount, kellyCap);
 
   if (rawAmount > kellyCap) {
