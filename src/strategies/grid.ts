@@ -8,17 +8,27 @@
  */
 
 import { log, formatUsd, logJson } from "../utils.js";
-import { getDCAHistory } from "./dca.js";
+import { getDCAHistory, isConfirmedDCAHistory } from "./dca.js";
 import type { FlywheelState } from "../brain/state.js";
 import { recordTrade } from "../brain/state.js";
 import { getCandles, calcATRPct, dynamicGridLevels } from "../indicators.js";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import { executeManagedSwap } from "../suwappu.js";
+import {
+  getUnaccountedExecution,
+  markExecutionAccounted,
+  runManagedExecution,
+  type ExecutionIntent,
+} from "../execution.js";
 
-const STATE_DIR = join(homedir(), ".suwappu-flywheel");
-const GRID_FILE = join(STATE_DIR, "grid-state.json");
+function stateDir(): string {
+  return process.env.SUWAPPU_FLYWHEEL_STATE_DIR ?? join(homedir(), ".suwappu-flywheel");
+}
+
+function gridFile(): string {
+  return join(stateDir(), "grid-state.json");
+}
 
 interface GridLevel {
   pctAboveEntry: number;
@@ -48,6 +58,9 @@ interface GridState {
     usdcReceived: number;
     swapId: string;
     txHash?: string;
+    intentId?: string;
+    executionStatus?: "completed" | "confirmed";
+    profit?: number;
     level: number;
   }>;
   totalProfit: number;
@@ -76,8 +89,8 @@ function buildLevels(atrPct: number): GridLevel[] {
 
 function loadGrid(): GridState {
   try {
-    if (existsSync(GRID_FILE)) {
-      const g = JSON.parse(readFileSync(GRID_FILE, "utf-8")) as GridState;
+    if (existsSync(gridFile())) {
+      const g = JSON.parse(readFileSync(gridFile(), "utf-8")) as GridState;
       // Ensure new fields exist (backward compat)
       if (g.lastATRPct === undefined) g.lastATRPct = 2.0;
       for (const level of g.levels) {
@@ -85,6 +98,12 @@ function loadGrid(): GridState {
         if (level.highWatermark === undefined) level.highWatermark = 0;
         if (level.callbackPct === undefined) level.callbackPct = 0.015;
       }
+      // Older Flywheel versions wrote sells at submission time. They cannot be
+      // trusted as fills, so only explicitly reconciled rows feed accounting.
+      g.sells = (g.sells ?? []).filter((sell) => (
+        sell.executionStatus === "completed" || sell.executionStatus === "confirmed"
+      ));
+      g.totalProfit = g.sells.reduce((sum, sell) => sum + (sell.profit ?? 0), 0);
       return g;
     }
   } catch {}
@@ -92,29 +111,48 @@ function loadGrid(): GridState {
 }
 
 function saveGrid(state: GridState) {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(GRID_FILE, JSON.stringify(state, null, 2));
+  const dir = stateDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(gridFile(), JSON.stringify(state, null, 2));
+}
+
+function saveGridAndAcknowledgeExecutions(state: GridState) {
+  // Persist strategy accounting before marking the execution journal consumed.
+  // A crash can then replay safely instead of losing a confirmed fill.
+  saveGrid(state);
+  for (const sell of state.sells) {
+    if (sell.intentId && sell.executionStatus === "completed") {
+      markExecutionAccounted(sell.intentId);
+    }
+  }
 }
 
 /** Sync grid state with DCA history */
 function syncWithDCA(grid: GridState): GridState {
-  const history = getDCAHistory();
-  if (history.length === 0) return grid;
-
-  let totalSpent = 0;
-  let totalEth = 0;
-  for (const entry of history) {
-    totalSpent += parseFloat(entry.amount);
-    totalEth += parseFloat(entry.toAmount);
+  const history = getDCAHistory().filter(isConfirmedDCAHistory);
+  if (history.length === 0) {
+    grid.totalUsdcSpent = 0;
+    grid.totalEthHeld = 0;
+    grid.avgEntryPrice = 0;
+    return grid;
   }
 
+  let totalSpent = 0;
+  let totalEthBought = 0;
+  for (const entry of history) {
+    totalSpent += parseFloat(entry.amount);
+    totalEthBought += parseFloat(entry.toAmount);
+  }
+
+  let totalEthSold = 0;
   for (const sell of grid.sells) {
-    totalEth -= sell.ethSold;
+    totalEthSold += sell.ethSold;
   }
 
   grid.totalUsdcSpent = totalSpent;
-  grid.totalEthHeld = Math.max(totalEth, 0);
-  grid.avgEntryPrice = totalEth > 0 ? totalSpent / totalEth : 0;
+  grid.totalEthHeld = Math.max(totalEthBought - totalEthSold, 0);
+  // Average unit cost does not rise merely because some units were sold.
+  grid.avgEntryPrice = totalEthBought > 0 ? totalSpent / totalEthBought : 0;
 
   return grid;
 }
@@ -137,6 +175,97 @@ async function updateDynamicLevels(grid: GridState): Promise<void> {
   } catch {
     // Binance unavailable — keep existing levels
   }
+}
+
+async function getGridSellQuote(apiKey: string, amount: string): Promise<{ id: string; toAmount: string }> {
+  const quoteRes = await fetch("https://api.suwappu.bot/v1/agent/quote", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from_token: "ETH", to_token: "USDC", amount, chain: "base" }),
+  });
+  const quote = await quoteRes.json() as {
+    quote_id?: string;
+    amount_out?: string;
+    error?: string;
+    message?: string;
+  };
+  if (!quoteRes.ok || !quote.quote_id || !quote.amount_out) {
+    throw new Error(quote.error ?? quote.message ?? `Grid quote failed (${quoteRes.status})`);
+  }
+  return { id: quote.quote_id, toAmount: quote.amount_out };
+}
+
+function finalizeGridSell(
+  grid: GridState,
+  levelIdx: number,
+  intent: ExecutionIntent,
+  brainState?: FlywheelState,
+): boolean {
+  if (intent.phase !== "completed" || !intent.swapId || !intent.actualFromAmount || !intent.actualToAmount) {
+    return false;
+  }
+  if (grid.sells.some((sell) => sell.intentId === intent.id || sell.swapId === intent.swapId)) {
+    return true;
+  }
+
+  const ethSold = parseFloat(intent.actualFromAmount);
+  const usdcReceived = parseFloat(intent.actualToAmount);
+  if (!Number.isFinite(ethSold) || ethSold <= 0 || !Number.isFinite(usdcReceived) || usdcReceived < 0) {
+    return false;
+  }
+
+  const level = grid.levels[levelIdx];
+  const avgEntryAtDecision = typeof intent.context?.avgEntryPrice === "number"
+    ? intent.context.avgEntryPrice
+    : grid.avgEntryPrice;
+  const referencePrice = typeof intent.context?.referencePrice === "number"
+    ? intent.context.referencePrice
+    : (ethSold > 0 ? usdcReceived / ethSold : 0);
+  const fillPrice = ethSold > 0 ? usdcReceived / ethSold : referencePrice;
+  const profit = usdcReceived - ethSold * avgEntryAtDecision;
+  const timestamp = new Date().toISOString();
+
+  level.triggered = true;
+  level.trailingActive = false;
+  level.triggerPrice = referencePrice;
+  level.swapId = intent.swapId;
+  level.txHash = intent.txHash;
+  level.timestamp = timestamp;
+
+  grid.sells.push({
+    timestamp,
+    price: fillPrice,
+    ethSold,
+    usdcReceived,
+    swapId: intent.swapId,
+    txHash: intent.txHash,
+    intentId: intent.id,
+    executionStatus: "completed",
+    profit,
+    level: levelIdx,
+  });
+  grid.totalProfit += profit;
+  grid.totalEthHeld = Math.max(0, grid.totalEthHeld - ethSold);
+
+  if (brainState && !brainState.trades.some((trade) => trade.intentId === intent.id)) {
+    recordTrade(brainState, {
+      timestamp,
+      strategy: "grid_sell",
+      token: "ETH",
+      chain: "base",
+      amountIn: ethSold,
+      amountOut: usdcReceived,
+      // For a sell record, priceAtEntry is the USD cost basis per ETH. The
+      // realized fill price is preserved in grid.sells[].price.
+      priceAtEntry: avgEntryAtDecision,
+      fearIndex: 0,
+      txHash: intent.txHash,
+      intentId: intent.id,
+      swapId: intent.swapId,
+    });
+  }
+
+  return true;
 }
 
 /** Check grid levels with trailing take-profit logic */
@@ -165,9 +294,41 @@ export async function checkGrid(opts: {
   grid = syncWithDCA(grid);
   await updateDynamicLevels(grid);
 
+  // Resume durable intents before evaluating new price triggers. A submitted
+  // level is never eligible for a second sell merely because price moved while
+  // the first swap was pending or the prior HTTP outcome was unknown.
+  const blockedLevels = new Set<number>();
+  if (execute) {
+    for (let i = 0; i < grid.levels.length; i++) {
+      const pending = getUnaccountedExecution("grid", `level.${i}`);
+      if (!pending) continue;
+      blockedLevels.add(i);
+      try {
+        const receipt = await runManagedExecution({
+          apiKey,
+          strategy: "grid",
+          actionKey: `level.${i}`,
+          terms: pending.terms,
+          getQuote: () => getGridSellQuote(apiKey, pending.terms.amount),
+          walletAddress: process.env.SUWAPPU_MANAGED_WALLET_ADDRESS,
+        });
+        if (finalizeGridSell(grid, i, receipt.intent, opts.brainState)) {
+          if (!opts.json) log("grid", `  CONFIRMED prior level ${i + 1} swap ${receipt.intent.swapId}`);
+        } else if (receipt.intent.phase === "failed") {
+          markExecutionAccounted(receipt.intent.id);
+          if (!opts.json) log("grid", `  Prior level ${i + 1} was not executed: ${receipt.intent.error ?? "failed"}`);
+        } else if (!opts.json) {
+          log("grid", `  Level ${i + 1} intent ${receipt.intent.id} is ${receipt.intent.phase}; waiting for final status`);
+        }
+      } catch (error) {
+        if (!opts.json) log("grid", `  Level ${i + 1} reconciliation deferred: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
   if (grid.avgEntryPrice === 0 || grid.totalEthHeld <= 0) {
     if (!opts.json) log("grid", "No positions to manage. Run DCA first.");
-    saveGrid(grid);
+    saveGridAndAcknowledgeExecutions(grid);
     return { currentPrice, avgEntry: 0, pnlPct: 0, levelsToTrigger: [], totalProfit: grid.totalProfit };
   }
 
@@ -182,7 +343,7 @@ export async function checkGrid(opts: {
 
   for (let i = 0; i < grid.levels.length; i++) {
     const level = grid.levels[i];
-    if (level.triggered) continue;
+    if (level.triggered || blockedLevels.has(i)) continue;
 
     const triggerPrice = grid.avgEntryPrice * (1 + level.pctAboveEntry);
     const pctLabel = `+${(level.pctAboveEntry * 100).toFixed(1)}%`;
@@ -251,64 +412,28 @@ export async function checkGrid(opts: {
       if (!opts.json) log("grid", `Selling ${ethToSellStr} ETH → USDC...`);
 
       try {
-        const quoteRes = await fetch("https://api.suwappu.bot/v1/agent/quote", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ from_token: "ETH", to_token: "USDC", amount: ethToSellStr, chain: "base" }),
+        const receipt = await runManagedExecution({
+          apiKey,
+          strategy: "grid",
+          actionKey: `level.${levelIdx}`,
+          terms: { fromToken: "ETH", toToken: "USDC", amount: ethToSellStr, chain: "base" },
+          getQuote: () => getGridSellQuote(apiKey, ethToSellStr),
+          walletAddress: process.env.SUWAPPU_MANAGED_WALLET_ADDRESS,
+          context: { referencePrice: currentPrice, avgEntryPrice: grid.avgEntryPrice },
         });
-        const quote = await quoteRes.json() as { quote_id?: string; amount_out?: string; success?: boolean };
+        const intent = receipt.intent;
 
-        if (!quote.quote_id) {
-          if (!opts.json) log("grid", `  Quote failed: ${JSON.stringify(quote)}`);
-          continue;
-        }
-
-        const swap = await executeManagedSwap(apiKey, quote.quote_id);
-        const usdcReceived = parseFloat(quote.amount_out ?? "0");
-        const costBasis = ethToSell * grid.avgEntryPrice;
-        const profit = usdcReceived - costBasis;
-
-        // An accepted swapId is the idempotency boundary for this grid level.
-        // Mark it consumed even if the tx hash is not available yet so the
-        // next scan cannot submit the same sell twice.
-        level.triggered = true;
-        level.trailingActive = false;
-        level.triggerPrice = currentPrice;
-        level.swapId = swap.swapId;
-        level.txHash = swap.txHash;
-        level.timestamp = new Date().toISOString();
-
-        grid.sells.push({
-          timestamp: new Date().toISOString(),
-          price: currentPrice,
-          ethSold: ethToSell,
-          usdcReceived,
-          swapId: swap.swapId,
-          txHash: swap.txHash,
-          level: levelIdx,
-        });
-
-        grid.totalProfit += profit;
-        grid.totalEthHeld -= ethToSell;
-
-        if (opts.brainState) {
-          recordTrade(opts.brainState, {
-            timestamp: new Date().toISOString(),
-            strategy: "grid_sell",
-            token: "ETH",
-            chain: "base",
-            amountIn: ethToSell,
-            amountOut: usdcReceived,
-            priceAtEntry: currentPrice,
-            fearIndex: 0,
-            txHash: swap.txHash,
-          });
-        }
-
-        if (!opts.json) {
-          log("grid", `  SUBMITTED! ${ethToSellStr} ETH → ~${usdcReceived.toFixed(2)} USDC | Swap ${swap.swapId} (${swap.status})`);
-          if (swap.txHash) log("grid", `  TX: ${swap.txHash}`);
-          if (swap.pollUrl) log("grid", `  Status: ${swap.pollUrl}`);
+        if (finalizeGridSell(grid, levelIdx, intent, opts.brainState)) {
+          if (!opts.json) {
+            log("grid", `  CONFIRMED! ${intent.actualFromAmount} ETH → ${intent.actualToAmount} USDC | Swap ${intent.swapId}`);
+            if (intent.txHash) log("grid", `  TX: ${intent.txHash}`);
+          }
+        } else if (intent.phase === "failed") {
+          markExecutionAccounted(intent.id);
+          if (!opts.json) log("grid", `  NOT EXECUTED: ${intent.error ?? intent.swapStatus ?? "failed"}`);
+        } else if (!opts.json) {
+          log("grid", `  SUBMITTED: intent ${intent.id}${intent.swapId ? ` | Swap ${intent.swapId}` : ""} (${intent.swapStatus ?? intent.phase})`);
+          log("grid", "  Holdings and realized P&L are unchanged until reconciliation confirms the swap.");
         }
       } catch (e: any) {
         if (!opts.json) log("grid", `  Error: ${e.message}`);
@@ -323,10 +448,10 @@ export async function checkGrid(opts: {
     grid.levels = buildLevels(grid.lastATRPct);
   }
 
-  saveGrid(grid);
+  saveGridAndAcknowledgeExecutions(grid);
 
   if (!opts.json) {
-    log("grid", `Total realized profit: ${formatUsd(grid.totalProfit)}`);
+    log("grid", `Confirmed realized profit: ${formatUsd(grid.totalProfit)}`);
   }
 
   if (opts.json) {
