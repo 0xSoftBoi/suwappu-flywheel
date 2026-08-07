@@ -40,7 +40,7 @@ function getClient() {
 
 const program = new Command()
   .name("suwappu-flywheel")
-  .description("Multi-strategy DeFi agent built on the Suwappu SDK and API")
+  .description("Suwappu strategy lab and outcome-safe managed-execution reference")
   .version("1.0.0");
 
 // ── Yield ──
