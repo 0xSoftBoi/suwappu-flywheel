@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add a contributor release contract that makes managed-execution, idempotency, reconciliation, accounting, and strategy-evidence invariants explicit.
+
 ## 2.0.0 — 2026-08-07
 
 ### Enterprise operating contract
