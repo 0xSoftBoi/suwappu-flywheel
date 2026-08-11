@@ -22,7 +22,7 @@
   },
   "dependencies": {
     "@suwappu/sdk": "^0.4.0",
-    "commander": "^12.0.0"
+    "commander": "^15.0.0"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
